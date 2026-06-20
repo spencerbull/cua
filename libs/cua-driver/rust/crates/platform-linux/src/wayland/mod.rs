@@ -6,7 +6,9 @@
 //! `list_windows` works on native Wayland. Capture and input slices land next.
 
 use std::collections::HashMap;
+use std::process::Command;
 
+use serde::Deserialize;
 use wayland_client::{
     event_created_child,
     protocol::{wl_output::{self, WlOutput}, wl_pointer::ButtonState, wl_registry, wl_seat::WlSeat},
@@ -22,9 +24,6 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
-
-/// Linux evdev BTN_LEFT — the button code the virtual-pointer protocol expects.
-const BTN_LEFT: u32 = 0x110;
 
 use crate::x11::WindowInfo;
 
@@ -50,15 +49,32 @@ pub fn wayland_enabled() -> bool {
     }
 }
 
+/// True when the current desktop is Hyprland/Omarchy's Wayland compositor.
+///
+/// Hyprland commonly exposes both `WAYLAND_DISPLAY` and an XWayland `DISPLAY`.
+/// The generic Wayland backend originally avoided native Wayland whenever
+/// `DISPLAY` existed, which made Hyprland sessions silently fall back to the X11
+/// path. Hyprland gives us the missing window geometry/pid state through IPC, so
+/// we can safely auto-enable the native backend for it.
+pub fn is_hyprland_session() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+        || std::env::var("XDG_CURRENT_DESKTOP")
+            .map(|v| v.to_ascii_lowercase().contains("hyprland"))
+            .unwrap_or(false)
+}
+
+pub fn native_wayland_allowed() -> bool {
+    wayland_enabled() || is_hyprland_session()
+}
+
 /// True when we should drive Wayland rather than X11: the experimental backend
-/// is opted in ([`wayland_enabled`]), a Wayland display is present, and there is
-/// no X11 DISPLAY to fall back to. Without the opt-in this returns false even on
-/// a pure-Wayland session, so the backend treats it as unsupported rather than
-/// silently engaging an incomplete code path.
+/// is opted in ([`wayland_enabled`]) or this is a Hyprland session, a Wayland
+/// display is present, and either no X11 DISPLAY exists or Hyprland IPC can
+/// supply the native window metadata that generic Wayland protocols omit.
 pub fn is_wayland() -> bool {
-    wayland_enabled()
+    native_wayland_allowed()
         && std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("DISPLAY").is_none()
+        && (std::env::var_os("DISPLAY").is_none() || is_hyprland_session())
 }
 
 fn wl_sockets(dir: &str) -> std::collections::HashSet<String> {
@@ -131,6 +147,245 @@ struct Toplevel {
     title: String,
     app_id: String,
     closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HyprClient {
+    address: String,
+    #[serde(default)]
+    mapped: bool,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    at: [i32; 2],
+    #[serde(default)]
+    size: [u32; 2],
+    #[serde(default)]
+    class: String,
+    #[serde(default)]
+    title: String,
+    pid: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HyprMonitor {
+    #[serde(default)]
+    name: String,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    #[serde(default = "default_scale")]
+    scale: f64,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default)]
+    disabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HyprCursor {
+    x: i32,
+    y: i32,
+}
+
+fn default_scale() -> f64 { 1.0 }
+
+fn hyprctl_json<T: for<'de> Deserialize<'de>>(args: &[&str]) -> anyhow::Result<T> {
+    let out = Command::new("hyprctl").arg("-j").args(args).output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "hyprctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+fn hypr_address_to_id(address: &str) -> Option<u64> {
+    u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()
+}
+
+fn hypr_id_to_address(id: u64) -> String {
+    format!("0x{id:x}")
+}
+
+fn hypr_clients() -> anyhow::Result<Vec<HyprClient>> {
+    hyprctl_json(&["clients"])
+}
+
+fn hypr_monitors() -> anyhow::Result<Vec<HyprMonitor>> {
+    hyprctl_json(&["monitors"])
+}
+
+fn hypr_monitor_logical_size(monitor: &HyprMonitor) -> (u32, u32) {
+    let scale = monitor.scale.max(1.0);
+    (
+        ((monitor.width as f64) / scale).round().max(1.0) as u32,
+        ((monitor.height as f64) / scale).round().max(1.0) as u32,
+    )
+}
+
+fn hypr_monitor_for_logical_point(x: f64, y: f64) -> anyhow::Result<HyprMonitor> {
+    let monitors = hypr_monitors()?;
+    monitors
+        .iter()
+        .filter(|m| !m.disabled)
+        .find(|m| {
+            let (w, h) = hypr_monitor_logical_size(m);
+            x >= m.x as f64
+                && y >= m.y as f64
+                && x < (m.x + w as i32) as f64
+                && y < (m.y + h as i32) as f64
+        })
+        .or_else(|| monitors.iter().find(|m| m.focused && !m.disabled))
+        .or_else(|| monitors.iter().find(|m| !m.disabled))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("hyprctl monitors returned no enabled monitors"))
+}
+
+fn hypr_monitor_for_window(window_id: u64) -> anyhow::Result<HyprMonitor> {
+    let client = hypr_client_for_window(window_id)?;
+    hypr_monitor_for_logical_point(client.at[0] as f64, client.at[1] as f64)
+}
+
+fn hypr_client_for_window(window_id: u64) -> anyhow::Result<HyprClient> {
+    let address = hypr_id_to_address(window_id);
+    hypr_clients()?
+        .into_iter()
+        .find(|c| c.address.eq_ignore_ascii_case(&address))
+        .ok_or_else(|| anyhow::anyhow!("no Hyprland client for window_id {window_id}"))
+}
+
+fn hypr_focus_window(address: &str) -> anyhow::Result<()> {
+    let selector = format!("address:{address}");
+    let out = Command::new("hyprctl")
+        .args(["dispatch", "focuswindow", &selector])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("hyprctl dispatch focuswindow failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+pub fn focus_window_for_input(window_id: u64) -> anyhow::Result<()> {
+    if is_hyprland_session() {
+        let client = hypr_client_for_window(window_id)?;
+        hypr_focus_window(&client.address)?;
+    }
+    Ok(())
+}
+
+fn hypr_layout_bounds() -> anyhow::Result<(i32, i32, u32, u32)> {
+    let monitors: Vec<HyprMonitor> = hypr_monitors()?.into_iter().filter(|m| !m.disabled).collect();
+    if monitors.is_empty() {
+        anyhow::bail!("hyprctl monitors returned no enabled monitors");
+    }
+    let min_x = monitors.iter().map(|m| m.x).min().unwrap_or(0);
+    let min_y = monitors.iter().map(|m| m.y).min().unwrap_or(0);
+    let max_x = monitors
+        .iter()
+        .map(|m| {
+            let (w, _) = hypr_monitor_logical_size(m);
+            m.x.saturating_add(w as i32)
+        })
+        .max()
+        .unwrap_or(min_x);
+    let max_y = monitors
+        .iter()
+        .map(|m| {
+            let (_, h) = hypr_monitor_logical_size(m);
+            m.y.saturating_add(h as i32)
+        })
+        .max()
+        .unwrap_or(min_y);
+    Ok((min_x, min_y, (max_x - min_x).max(1) as u32, (max_y - min_y).max(1) as u32))
+}
+
+/// Hyprland-native window enumeration through `hyprctl clients -j`, including
+/// pid and geometry that generic Wayland foreign-toplevel protocols omit.
+pub fn list_hyprland_windows(filter_pid: Option<u32>) -> anyhow::Result<Vec<WindowInfo>> {
+    let mut out = Vec::new();
+    for c in hypr_clients()? {
+        if !c.mapped || c.hidden {
+            continue;
+        }
+        if let Some(pid) = filter_pid {
+            if c.pid != Some(pid) {
+                continue;
+            }
+        }
+        let Some(id) = hypr_address_to_id(&c.address) else {
+            continue;
+        };
+        let title = match (c.title.trim().is_empty(), c.class.trim().is_empty()) {
+            (true, true) => c.address.clone(),
+            (false, true) => c.title.clone(),
+            (true, false) => format!("[{}]", c.class),
+            (false, false) => format!("{} [{}]", c.title, c.class),
+        };
+        out.push(WindowInfo {
+            xid: id,
+            pid: c.pid,
+            title,
+            x: c.at[0],
+            y: c.at[1],
+            width: c.size[0],
+            height: c.size[1],
+        });
+    }
+    Ok(out)
+}
+
+pub fn hyprland_screen_size() -> anyhow::Result<(u32, u32, f64)> {
+    let monitors = hypr_monitors()?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m.focused && !m.disabled)
+        .or_else(|| monitors.iter().find(|m| !m.disabled))
+        .ok_or_else(|| anyhow::anyhow!("hyprctl monitors returned no enabled monitors"))?;
+    let (w, h) = hypr_monitor_logical_size(monitor);
+    Ok((w, h, monitor.scale))
+}
+
+pub fn hyprland_physical_screen_size() -> anyhow::Result<(u32, u32, f64)> {
+    let monitors = hypr_monitors()?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m.focused && !m.disabled)
+        .or_else(|| monitors.iter().find(|m| !m.disabled))
+        .ok_or_else(|| anyhow::anyhow!("hyprctl monitors returned no enabled monitors"))?;
+    Ok((monitor.width, monitor.height, monitor.scale))
+}
+
+pub fn hyprland_cursor_position() -> anyhow::Result<(i32, i32)> {
+    let pos: HyprCursor = hyprctl_json(&["cursorpos"])?;
+    Ok((pos.x, pos.y))
+}
+
+pub fn hyprland_window_geometry(window_id: u64) -> anyhow::Result<(i32, i32, u32, u32)> {
+    let client = hypr_client_for_window(window_id)?;
+    Ok((client.at[0], client.at[1], client.size[0], client.size[1]))
+}
+
+pub fn hyprland_window_scale(window_id: u64) -> anyhow::Result<f64> {
+    let monitor = hypr_monitor_for_window(window_id)?;
+    Ok(monitor.scale.max(1.0))
+}
+
+pub fn hyprland_window_local_to_screen(window_id: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    let (wx, wy, _, _) = hyprland_window_geometry(window_id)?;
+    Ok((wx as f64 + x, wy as f64 + y))
+}
+
+pub fn hyprland_window_local_to_capture(window_id: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    let (sx, sy) = hyprland_window_local_to_screen(window_id, x, y)?;
+    let monitor = hypr_monitor_for_logical_point(sx, sy)?;
+    Ok((
+        (sx - monitor.x as f64) * monitor.scale.max(1.0),
+        (sy - monitor.y as f64) * monitor.scale.max(1.0),
+    ))
 }
 
 #[derive(Default)]
@@ -321,20 +576,74 @@ pub fn screenshot_bytes() -> anyhow::Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+pub fn hyprland_screenshot_window_monitor(window_id: u64) -> anyhow::Result<Vec<u8>> {
+    let monitor = hypr_monitor_for_window(window_id)?;
+    if monitor.name.trim().is_empty() {
+        return screenshot_bytes();
+    }
+    let out = std::process::Command::new("grim")
+        .args(["-t", "png", "-o", monitor.name.as_str(), "-"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("grim -o {} failed: {}", monitor.name, String::from_utf8_lossy(&out.stderr));
+    }
+    if out.stdout.is_empty() {
+        anyhow::bail!("grim -o {} produced no output", monitor.name);
+    }
+    Ok(out.stdout)
+}
+
 /// Capture dispatcher: native Wayland (grim) when applicable, else X11.
 pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
-    if is_wayland() {
+    if is_hyprland_session() {
+        hyprland_screenshot_window_monitor(xid)
+    } else if is_wayland() {
         screenshot_bytes()
     } else {
         crate::capture::screenshot_window_bytes(xid)
     }
 }
 
+fn virtual_pointer_click(
+    state: &mut State,
+    qh: &QueueHandle<State>,
+    queue: &mut wayland_client::EventQueue<State>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    button: u8,
+    count: usize,
+) -> anyhow::Result<()> {
+    let seat = state
+        .seat
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("compositor exposed no wl_seat for virtual pointer"))?;
+    let mgr = state
+        .vptr_manager
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("compositor does not expose zwlr_virtual_pointer_manager_v1"))?;
+    let button = evdev_button(button as u32);
+    let vptr = mgr.create_virtual_pointer(Some(&seat), qh, ());
+    vptr.motion_absolute(0, x.min(width.saturating_sub(1)), y.min(height.saturating_sub(1)), width.max(1), height.max(1));
+    vptr.frame();
+    for _ in 0..count.max(1) {
+        vptr.button(0, button, ButtonState::Pressed);
+        vptr.frame();
+        vptr.button(0, button, ButtonState::Released);
+        vptr.frame();
+    }
+    queue.roundtrip(state)?;
+    vptr.destroy();
+    queue.roundtrip(state)?;
+    Ok(())
+}
+
 /// Click a native Wayland toplevel identified by its `window_id` (the
 /// foreign-toplevel protocol id from `list_windows`). Wayland forbids a client
-/// from knowing another window's on-screen geometry, so we cannot map the
-/// caller's window-local x/y to a global pointer position. Instead, the
-/// focused-input model is two steps:
+/// from knowing another window's on-screen geometry; on Hyprland we recover that
+/// geometry through `hyprctl clients -j`, otherwise the generic focused-input
+/// model is two steps:
 ///   1. `activate` the target toplevel (foreign-toplevel) — focus+raise it, so
 ///      on a stacking layout it fills the output.
 ///   2. land a real virtual-pointer button press at the output centre (now over
@@ -343,14 +652,32 @@ pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
 ///      the compositor route the subsequent virtual-keyboard input to the
 ///      target. (labwc routes it from `activate` alone; the centre click is
 ///      harmless there since the activated window is centred under the cursor.)
-pub fn click(window_id: u64) -> anyhow::Result<()> {
+pub fn click_at(window_id: u64, x: f64, y: f64, count: usize, button: u8) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
+    let hyprland = is_hyprland_session();
     let mut state = State::default();
     queue.roundtrip(&mut state)?; // bind manager + seat + vptr + outputs
+
+    if hyprland {
+        for _ in 0..2 {
+            queue.roundtrip(&mut state)?; // drain seat / virtual-pointer / output mode events
+        }
+        let client = hypr_client_for_window(window_id)?;
+        hypr_focus_window(&client.address)?;
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let (min_x, min_y, width, height) =
+            hypr_layout_bounds().unwrap_or((0, 0, state.output_w.max(1), state.output_h.max(1)));
+        let global_x = client.at[0] as f64 + x.clamp(0.0, client.size[0].saturating_sub(1) as f64);
+        let global_y = client.at[1] as f64 + y.clamp(0.0, client.size[1].saturating_sub(1) as f64);
+        let vx = (global_x - min_x as f64).round().max(0.0) as u32;
+        let vy = (global_y - min_y as f64).round().max(0.0) as u32;
+        return virtual_pointer_click(&mut state, &qh, &mut queue, vx, vy, width, height, button, count);
+    }
+
     if state.manager.is_none() {
         anyhow::bail!("compositor does not expose zwlr_foreign_toplevel_manager_v1");
     }
@@ -372,20 +699,8 @@ pub fn click(window_id: u64) -> anyhow::Result<()> {
     queue.roundtrip(&mut state)?; // flush activate so the target is focused/raised
 
     // Land a button press at the output centre (over the now-focused window).
-    if let Some(mgr) = state.vptr_manager.clone() {
-        let (w, h) = (state.output_w.max(1), state.output_h.max(1));
-        let vptr = mgr.create_virtual_pointer(Some(&seat), &qh, ());
-        vptr.motion_absolute(0, w / 2, h / 2, w, h);
-        vptr.frame();
-        vptr.button(0, BTN_LEFT, ButtonState::Pressed);
-        vptr.frame();
-        vptr.button(0, BTN_LEFT, ButtonState::Released);
-        vptr.frame();
-        queue.roundtrip(&mut state)?;
-        vptr.destroy();
-        queue.roundtrip(&mut state)?;
-    }
-    Ok(())
+    let (w, h) = (state.output_w.max(1), state.output_h.max(1));
+    virtual_pointer_click(&mut state, &qh, &mut queue, w / 2, h / 2, w, h, button, count)
 }
 
 /// Type Unicode text into the focused Wayland surface via `wtype` (the
@@ -422,6 +737,45 @@ pub fn press_key(key: &str) -> anyhow::Result<()> {
         anyhow::bail!("wtype -k {keysym} failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
+}
+
+pub fn press_key_with_modifiers(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
+    let keysym = key_to_keysym(key);
+    let mut args = Vec::new();
+    let mut mods = Vec::new();
+    for modifier in modifiers {
+        let mapped = modifier_to_wtype(modifier);
+        if mapped.is_empty() {
+            continue;
+        }
+        args.push("-M".to_owned());
+        args.push(mapped.clone());
+        mods.push(mapped);
+    }
+    args.push("-k".to_owned());
+    args.push(keysym.clone());
+    for modifier in mods.iter().rev() {
+        args.push("-m".to_owned());
+        args.push(modifier.clone());
+    }
+    let out = std::process::Command::new("wtype").args(&args).output()?;
+    if !out.status.success() {
+        anyhow::bail!("wtype hotkey {keysym} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+fn modifier_to_wtype(modifier: &str) -> String {
+    match modifier.to_ascii_lowercase().as_str() {
+        "control" | "ctrl" => "ctrl",
+        "option" | "alt" => "alt",
+        "altgr" => "altgr",
+        "shift" => "shift",
+        "super" | "meta" | "cmd" | "command" | "logo" | "win" => "logo",
+        "capslock" | "caps_lock" => "capslock",
+        _ => "",
+    }
+    .to_owned()
 }
 
 /// Map cua key names to X keysym names that `wtype -k` understands. Unknown
@@ -612,6 +966,15 @@ pub fn inject_parallel_drags(drags: &[InjectDrag]) -> anyhow::Result<()> {
 /// Window-enumeration dispatcher: native Wayland when applicable, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if is_wayland() {
+        if is_hyprland_session() {
+            match list_hyprland_windows(filter_pid) {
+                Ok(ws) => return ws,
+                Err(e) => {
+                    tracing::warn!("hyprland list_windows failed, falling back to X11: {e}");
+                    return crate::x11::list_windows(filter_pid);
+                }
+            }
+        }
         match list_windows() {
             Ok(ws) => return ws, // foreign-toplevel has no pid, so filter_pid can't apply
             Err(e) => tracing::warn!("wayland list_windows failed, falling back to X11: {e}"),

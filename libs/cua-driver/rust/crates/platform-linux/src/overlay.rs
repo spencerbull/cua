@@ -248,8 +248,19 @@ pub fn run_on_thread() {
     }
 
     std::thread::Builder::new()
-        .name("cua-overlay-x11".into())
+        .name(if crate::wayland::is_wayland() {
+            "cua-overlay-wayland".into()
+        } else {
+            "cua-overlay-x11".into()
+        })
         .spawn(move || {
+            #[cfg(target_os = "linux")]
+            if crate::wayland::is_wayland() {
+                if let Err(e) = run_wayland_layer_overlay_thread(cfg, rx) {
+                    tracing::warn!("Wayland layer-shell overlay unavailable: {e}");
+                }
+                return;
+            }
             run_overlay_thread(cfg, rx);
         })
         .expect("spawn overlay thread");
@@ -459,6 +470,364 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     }
 }
 
+// ── Wayland layer-shell thread ───────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn run_wayland_layer_overlay_thread(
+    cfg: CursorConfig,
+    rx: std::sync::mpsc::Receiver<OverlayMsg>,
+) -> anyhow::Result<()> {
+    use std::collections::VecDeque;
+    use wayland_client::{
+        delegate_noop,
+        protocol::{
+            wl_buffer, wl_compositor, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+        },
+        Connection, Dispatch, QueueHandle,
+    };
+    use wayland_protocols_wlr::layer_shell::v1::client::{
+        zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+        zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
+    };
+
+    struct WaylandOverlayState {
+        compositor: Option<wl_compositor::WlCompositor>,
+        shm: Option<wl_shm::WlShm>,
+        layer_shell: Option<ZwlrLayerShellV1>,
+        surface: Option<wl_surface::WlSurface>,
+        layer_surface: Option<ZwlrLayerSurfaceV1>,
+        configured: bool,
+        logical_w: u32,
+        logical_h: u32,
+        buffer_scale: i32,
+        buffers: VecDeque<wl_buffer::WlBuffer>,
+    }
+
+    impl WaylandOverlayState {
+        fn from_cursor_cfg(_cfg: &CursorConfig) -> Self {
+            let (logical_w, logical_h, buffer_scale) = wayland_overlay_metrics();
+            Self {
+                compositor: None,
+                shm: None,
+                layer_shell: None,
+                surface: None,
+                layer_surface: None,
+                configured: false,
+                logical_w,
+                logical_h,
+                buffer_scale,
+                buffers: VecDeque::new(),
+            }
+        }
+
+        fn init_layer_surface(&mut self, qh: &QueueHandle<Self>) {
+            if self.surface.is_some() || self.compositor.is_none() || self.layer_shell.is_none() {
+                return;
+            }
+            let compositor = self.compositor.as_ref().unwrap();
+            let layer_shell = self.layer_shell.as_ref().unwrap();
+            let surface = compositor.create_surface(qh, ());
+
+            // Empty input region keeps the overlay click-through.
+            let region = compositor.create_region(qh, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+
+            let layer_surface = layer_shell.get_layer_surface(
+                &surface,
+                None,
+                zwlr_layer_shell_v1::Layer::Overlay,
+                "cua-agent-cursor-overlay".to_owned(),
+                qh,
+                (),
+            );
+            let anchor = zwlr_layer_surface_v1::Anchor::Top
+                | zwlr_layer_surface_v1::Anchor::Bottom
+                | zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right;
+            layer_surface.set_anchor(anchor);
+            layer_surface.set_exclusive_zone(-1);
+            layer_surface.set_margin(0, 0, 0, 0);
+            layer_surface.set_keyboard_interactivity(
+                zwlr_layer_surface_v1::KeyboardInteractivity::None,
+            );
+            // Ask the compositor for the full anchored output. Configure will
+            // return the logical dimensions before the first buffer attach.
+            layer_surface.set_size(0, 0);
+            surface.commit();
+
+            self.surface = Some(surface);
+            self.layer_surface = Some(layer_surface);
+        }
+
+        fn render(&mut self, qh: &QueueHandle<Self>) -> anyhow::Result<()> {
+            let Some(surface) = self.surface.as_ref() else { return Ok(()) };
+            let Some(shm) = self.shm.as_ref() else { return Ok(()) };
+            if !self.configured {
+                return Ok(());
+            }
+
+            let scale = self.buffer_scale.max(1) as u32;
+            let render_w = self.logical_w.saturating_mul(scale).max(1);
+            let render_h = self.logical_h.saturating_mul(scale).max(1);
+            update_render_size(render_w, render_h);
+
+            let pixmap = {
+                let guard = RENDER.lock().unwrap();
+                guard.as_ref().map(|map| {
+                    let mut pm = tiny_skia::Pixmap::new(render_w, render_h)
+                        .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
+                    for rs in map.cursors.values() {
+                        cursor_overlay::paint_cursor(&mut pm, &rs.core, 0.0, 0.0, None);
+                    }
+                    pm
+                })
+            };
+            let Some(pm) = pixmap else { return Ok(()) };
+            let bgra = pixmap_to_bgra(&pm);
+            let buffer = create_wayland_shm_buffer(shm, qh, render_w, render_h, &bgra)?;
+
+            surface.set_buffer_scale(self.buffer_scale.max(1));
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage(0, 0, self.logical_w.max(1) as i32, self.logical_h.max(1) as i32);
+            surface.commit();
+
+            self.buffers.push_back(buffer);
+            while self.buffers.len() > 8 {
+                if let Some(old) = self.buffers.pop_front() {
+                    old.destroy();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for WaylandOverlayState {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, version } = event {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor = Some(registry.bind::<wl_compositor::WlCompositor, _, _>(
+                            name,
+                            version.min(4),
+                            qh,
+                            (),
+                        ));
+                        state.init_layer_surface(qh);
+                    }
+                    "wl_shm" => {
+                        state.shm =
+                            Some(registry.bind::<wl_shm::WlShm, _, _>(name, version.min(1), qh, ()));
+                    }
+                    "zwlr_layer_shell_v1" => {
+                        state.layer_shell = Some(
+                            registry.bind::<ZwlrLayerShellV1, _, _>(name, version.min(4), qh, ()),
+                        );
+                        state.init_layer_surface(qh);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandOverlayState {
+        fn event(
+            state: &mut Self,
+            layer_surface: &ZwlrLayerSurfaceV1,
+            event: zwlr_layer_surface_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                    layer_surface.ack_configure(serial);
+                    if width > 0 {
+                        state.logical_w = width;
+                    }
+                    if height > 0 {
+                        state.logical_h = height;
+                    }
+                    state.configured = true;
+                }
+                zwlr_layer_surface_v1::Event::Closed => {
+                    state.configured = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    delegate_noop!(WaylandOverlayState: ignore wl_compositor::WlCompositor);
+    delegate_noop!(WaylandOverlayState: ignore wl_surface::WlSurface);
+    delegate_noop!(WaylandOverlayState: ignore wl_region::WlRegion);
+    delegate_noop!(WaylandOverlayState: ignore wl_shm::WlShm);
+    delegate_noop!(WaylandOverlayState: ignore wl_shm_pool::WlShmPool);
+    delegate_noop!(WaylandOverlayState: ignore wl_buffer::WlBuffer);
+    delegate_noop!(WaylandOverlayState: ignore ZwlrLayerShellV1);
+
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    let display = conn.display();
+    display.get_registry(&qh, ());
+
+    let mut state = WaylandOverlayState::from_cursor_cfg(&cfg);
+    queue.roundtrip(&mut state)?;
+    if state.layer_shell.is_none() {
+        anyhow::bail!("compositor did not advertise zwlr_layer_shell_v1");
+    }
+    if state.shm.is_none() {
+        anyhow::bail!("compositor did not advertise wl_shm");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !state.configured && Instant::now() < deadline {
+        queue.blocking_dispatch(&mut state)?;
+    }
+    if !state.configured {
+        anyhow::bail!("layer-shell overlay was not configured by the compositor");
+    }
+
+    let frame_dur = Duration::from_millis(16);
+    let mut last_tick = Instant::now();
+    loop {
+        let now = Instant::now();
+        let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
+        last_tick = now;
+        queue.dispatch_pending(&mut state)?;
+
+        let arrived = {
+            let mut guard = RENDER.lock().unwrap();
+            if let Some(map) = guard.as_mut() {
+                while let Ok(msg) = rx.try_recv() {
+                    if let Some(key) = apply_msg(map, msg) {
+                        map.last_active = Some(key);
+                    }
+                }
+                let mut arrived = Vec::new();
+                for (key, rs) in map.cursors.iter_mut() {
+                    if rs.tick(dt) {
+                        arrived.push(key.clone());
+                    }
+                }
+                arrived
+            } else {
+                Vec::new()
+            }
+        };
+
+        state.render(&qh)?;
+        conn.flush()?;
+        for key in &arrived {
+            arrival_fire(key);
+        }
+
+        let elapsed = Instant::now().duration_since(last_tick);
+        if let Some(remaining) = frame_dur.checked_sub(elapsed) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_overlay_metrics() -> (u32, u32, i32) {
+    if crate::wayland::is_hyprland_session() {
+        if let Ok((w, h, scale)) = crate::wayland::hyprland_physical_screen_size() {
+            let logical_w = ((w as f64) / scale.max(1.0)).round().max(1.0) as u32;
+            let logical_h = ((h as f64) / scale.max(1.0)).round().max(1.0) as u32;
+            return (logical_w, logical_h, 1);
+        }
+    }
+    (1920, 1080, 1)
+}
+
+#[cfg(target_os = "linux")]
+fn update_render_size(w: u32, h: u32) {
+    let mut guard = RENDER.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        map.scr_w = w.max(1);
+        map.scr_h = h.max(1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_wayland_shm_buffer(
+    shm: &wayland_client::protocol::wl_shm::WlShm,
+    qh: &wayland_client::QueueHandle<impl wayland_client::Dispatch<wayland_client::protocol::wl_shm_pool::WlShmPool, ()> + wayland_client::Dispatch<wayland_client::protocol::wl_buffer::WlBuffer, ()> + 'static>,
+    w: u32,
+    h: u32,
+    bgra: &[u8],
+) -> anyhow::Result<wayland_client::protocol::wl_buffer::WlBuffer> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::AsFd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wayland_client::protocol::wl_shm;
+
+    static SHM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    let stride = w
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("Wayland overlay buffer stride overflow"))?;
+    let size = stride
+        .checked_mul(h)
+        .ok_or_else(|| anyhow::anyhow!("Wayland overlay buffer size overflow"))?;
+    if bgra.len() != size as usize {
+        anyhow::bail!("Wayland overlay buffer size mismatch");
+    }
+
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
+    let path = format!(
+        "{runtime_dir}/cua-overlay-{}-{}.shm",
+        std::process::id(),
+        SHM_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    file.set_len(size as u64)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(bgra)?;
+    file.flush()?;
+
+    let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        w as i32,
+        h as i32,
+        stride as i32,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
+    pool.destroy();
+    Ok(buffer)
+}
+
+#[cfg(target_os = "linux")]
+fn pixmap_to_bgra(pm: &tiny_skia::Pixmap) -> Vec<u8> {
+    let src = pm.data();
+    let mut bgra: Vec<u8> = Vec::with_capacity(src.len());
+    for chunk in src.chunks_exact(4) {
+        bgra.push(chunk[2]); // B
+        bgra.push(chunk[1]); // G
+        bgra.push(chunk[0]); // R
+        bgra.push(chunk[3]); // A
+    }
+    bgra
+}
+
 // ── Z-order enforcer (Linux impl of cursor_overlay::ZOrderEnforcer) ──────
 
 /// X11 implementation of [`cursor_overlay::ZOrderEnforcer`].
@@ -511,7 +880,7 @@ impl<'a, C: x11rb::connection::Connection> ZOrderEnforcer for X11ZOrderEnforcer<
 
 #[cfg(target_os = "linux")]
 fn find_argb_visual(
-    conn: &impl x11rb::connection::Connection,
+    _conn: &impl x11rb::connection::Connection,
     screen: &x11rb::protocol::xproto::Screen,
 ) -> Option<(u32, u8, u32)> {
     use x11rb::protocol::xproto::VisualClass;

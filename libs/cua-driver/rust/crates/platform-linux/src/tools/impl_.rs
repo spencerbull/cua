@@ -549,10 +549,17 @@ fn resolve_element_local_coords(pid: u32, idx: usize, xid_hint: Option<u64>)
     let xid = if let Some(x) = xid_hint {
         x
     } else {
-        crate::x11::list_windows(Some(pid))
+        crate::wayland::list_windows_dispatch(Some(pid))
             .into_iter().next().map(|w| w.xid)
             .ok_or_else(|| anyhow::anyhow!("No windows for pid {pid}"))?
     };
+
+    if crate::wayland::is_hyprland_session() {
+        let (screen_x, screen_y) = crate::wayland::hyprland_window_local_to_screen(xid, 0.0, 0.0)?;
+        let local_x = screen_cx - screen_x;
+        let local_y = screen_cy - screen_y;
+        return Ok((xid, local_x, local_y));
+    }
 
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
@@ -571,6 +578,10 @@ fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_hyprland_session() {
+        return crate::wayland::hyprland_window_local_to_screen(xid, x, y);
+    }
+
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
     use x11rb::rust_connection::RustConnection;
@@ -877,14 +888,18 @@ impl Tool for ClickTool {
                 // Primary: AT-SPI doAction(0) — typically "click", no focus steal.
                 if crate::atspi::perform_action(pid, idx).is_ok() {
                     let xid = xid_hint.or_else(|| {
-                        crate::x11::list_windows(Some(pid)).into_iter().next().map(|w| w.xid)
+                        crate::wayland::list_windows_dispatch(Some(pid)).into_iter().next().map(|w| w.xid)
                     }).unwrap_or(0);
                     return Ok((xid, screen_cx, screen_cy));
                 }
 
-                // Fallback: XSendEvent at window-local coords.
+                // Fallback: pixel click at window-local coords.
                 let (xid, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
-                crate::input::send_click(xid, lx as i32, ly as i32, count, button)?;
+                if crate::wayland::is_wayland() {
+                    crate::wayland::click_at(xid, lx, ly, count, button)?;
+                } else {
+                    crate::input::send_click(xid, lx as i32, ly as i32, count, button)?;
+                }
                 Ok((xid, screen_cx, screen_cy))
             }).await;
             return match result {
@@ -948,7 +963,7 @@ impl Tool for ClickTool {
             // x/y can't be mapped to a global pointer position; activating the
             // window the caller targeted is the focus-based equivalent.
             if crate::wayland::is_wayland() {
-                return crate::wayland::click(xid);
+                return crate::wayland::click_at(xid, x, y, count, button);
             }
             crate::input::send_click(xid, xi, yi, count, button)
         }).await;
@@ -997,7 +1012,7 @@ impl Tool for TypeTextTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid))).await.unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(Some(pid))).await.unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => return ToolResult::error(format!("No windows found for pid {pid}. Provide window_id.")),
@@ -1028,7 +1043,10 @@ impl Tool for TypeTextTool {
             let text_len = text.chars().count();
             let text_w = text.clone();
             let result =
-                tokio::task::spawn_blocking(move || crate::wayland::type_text(&text_w)).await;
+                tokio::task::spawn_blocking(move || {
+                    crate::wayland::focus_window_for_input(xid)?;
+                    crate::wayland::type_text(&text_w)
+                }).await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
@@ -1189,7 +1207,7 @@ impl Tool for PressKeyTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid))).await.unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(Some(pid))).await.unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => return ToolResult::error(format!("No windows found for pid {pid}. Provide window_id.")),
@@ -1211,7 +1229,10 @@ impl Tool for PressKeyTool {
         // Native Wayland: send the key to the focused surface via virtual-keyboard.
         if crate::wayland::is_wayland() {
             let key_w = key.clone();
-            let result = tokio::task::spawn_blocking(move || crate::wayland::press_key(&key_w)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::wayland::focus_window_for_input(xid)?;
+                crate::wayland::press_key(&key_w)
+            }).await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Pressed key '{key}' (via Wayland virtual-keyboard)."
@@ -1277,7 +1298,7 @@ impl Tool for HotkeyTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid))).await.unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(Some(pid))).await.unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => return ToolResult::error(format!("No windows found for pid {pid}. Provide window_id.")),
@@ -1304,6 +1325,10 @@ impl Tool for HotkeyTool {
         let key_display = format!("{}+{}", mods.join("+"), key);
         let result = tokio::task::spawn_blocking(move || {
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
+            if crate::wayland::is_wayland() {
+                crate::wayland::focus_window_for_input(xid)?;
+                return crate::wayland::press_key_with_modifiers(&key, &m);
+            }
             crate::input::send_key(xid, &key, &m)
         }).await;
         match result {
@@ -1408,7 +1433,7 @@ impl Tool for ScrollTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid))).await.unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(Some(pid))).await.unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => return ToolResult::error(format!("No windows found for pid {pid}. Provide window_id.")),
@@ -1422,6 +1447,9 @@ impl Tool for ScrollTool {
             "up" => 4, "left" => 6, "right" => 7, _ => 5,
         };
         let result = tokio::task::spawn_blocking(move || {
+            if crate::wayland::is_wayland() {
+                anyhow::bail!("scroll is not implemented for native Wayland yet; use keyboard paging or AT-SPI actions where available");
+            }
             crate::input::send_click(xid, 0, 0, amount, button)
         }).await;
         match result {
@@ -1489,7 +1517,13 @@ impl Tool for DoubleClickTool {
                             cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
                         );
                     }
-                    match tokio::task::spawn_blocking(move || crate::input::send_click(xid, lx as i32, ly as i32, 2, 1)).await {
+                    match tokio::task::spawn_blocking(move || {
+                        if crate::wayland::is_wayland() {
+                            crate::wayland::click_at(xid, lx, ly, 2, 1)
+                        } else {
+                            crate::input::send_click(xid, lx as i32, ly as i32, 2, 1)
+                        }
+                    }).await {
                         Ok(Ok(())) => ToolResult::text(format!("✅ Double-clicked element [{idx}].")),
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1530,7 +1564,12 @@ impl Tool for DoubleClickTool {
             );
         }
         let (xi, yi) = (x as i32, y as i32);
-        let result = tokio::task::spawn_blocking(move || crate::input::send_click(xid, xi, yi, 2, 1)).await;
+        let result = tokio::task::spawn_blocking(move || {
+            if crate::wayland::is_wayland() {
+                return crate::wayland::click_at(xid, x, y, 2, 1);
+            }
+            crate::input::send_click(xid, xi, yi, 2, 1)
+        }).await;
         match result {
             Ok(Ok(())) => ToolResult::text(format!("✅ Double-clicked at ({x:.1}, {y:.1}).")),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
@@ -1591,7 +1630,13 @@ impl Tool for RightClickTool {
                             cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
                         );
                     }
-                    match tokio::task::spawn_blocking(move || crate::input::send_click(xid, lx as i32, ly as i32, 1, 3)).await {
+                    match tokio::task::spawn_blocking(move || {
+                        if crate::wayland::is_wayland() {
+                            crate::wayland::click_at(xid, lx, ly, 1, 3)
+                        } else {
+                            crate::input::send_click(xid, lx as i32, ly as i32, 1, 3)
+                        }
+                    }).await {
                         Ok(Ok(())) => ToolResult::text(format!("✅ Right-clicked element [{idx}].")),
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1632,7 +1677,12 @@ impl Tool for RightClickTool {
             );
         }
         let (xi, yi) = (x as i32, y as i32);
-        let result = tokio::task::spawn_blocking(move || crate::input::send_click(xid, xi, yi, 1, 3)).await;
+        let result = tokio::task::spawn_blocking(move || {
+            if crate::wayland::is_wayland() {
+                return crate::wayland::click_at(xid, x, y, 1, 3);
+            }
+            crate::input::send_click(xid, xi, yi, 1, 3)
+        }).await;
         match result {
             Ok(Ok(())) => ToolResult::text(format!("✅ Right-clicked at ({x:.1}, {y:.1}).")),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
@@ -2416,6 +2466,9 @@ impl Tool for GetScreenSizeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let result = tokio::task::spawn_blocking(|| {
+            if crate::wayland::is_hyprland_session() {
+                return crate::wayland::hyprland_screen_size();
+            }
             use x11rb::connection::Connection;
             use x11rb::rust_connection::RustConnection;
             let (conn, screen_num) = RustConnection::connect(None)?;
@@ -2458,6 +2511,9 @@ impl Tool for GetCursorPositionTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let result = tokio::task::spawn_blocking(|| {
+            if crate::wayland::is_hyprland_session() {
+                return crate::wayland::hyprland_cursor_position();
+            }
             use x11rb::connection::Connection;
             use x11rb::protocol::xproto::ConnectionExt as _;
             use x11rb::rust_connection::RustConnection;
@@ -2685,7 +2741,6 @@ impl Tool for SetAgentCursorStyleTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        use cua_driver_core::tool_args::ArgsExt;
         let cursor_id = resolve_cursor_key(&args);
 
         // image_path
@@ -2827,12 +2882,13 @@ impl Tool for CheckPermissionsTool {
             || std::path::Path::new("/run/user").exists();
 
         let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+        let hyprland = crate::wayland::is_hyprland_session();
         let status_text = format!(
-            "X11 display: {}\nWayland: {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
+            "X11 display: {}\nWayland: {}\nHyprland IPC: {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
             if x11_ok { "✅ connected" } else { "❌ DISPLAY not set or X11 unavailable" },
             match &wayland_display {
-                Some(s) if crate::wayland::wayland_enabled() =>
-                    format!("✅ native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend ENABLED"),
+                Some(s) if crate::wayland::native_wayland_allowed() =>
+                    format!("✅ native Wayland session (WAYLAND_DISPLAY={s}) — backend enabled"),
                 Some(s) => format!(
                     "⚠️  native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend OFF; \
                      set {}=1 to enable it",
@@ -2840,11 +2896,20 @@ impl Tool for CheckPermissionsTool {
                 ),
                 None => "❌ not a Wayland session".to_string(),
             },
+            if hyprland { "✅ detected" } else { "not detected" },
             if atspi_ok { "✅ D-Bus session available" } else { "⚠️  D-Bus session not detected" },
             if x11_ok { "✅ available" } else { "❌ requires X11" }
         );
         ToolResult::text(status_text)
-            .with_structured(json!({ "x11": x11_ok, "wayland": wayland_display.is_some(), "wayland_enabled": crate::wayland::wayland_enabled(), "atspi": atspi_ok, "xsend_event": x11_ok }))
+            .with_structured(json!({
+                "x11": x11_ok,
+                "wayland": wayland_display.is_some(),
+                "wayland_enabled": crate::wayland::wayland_enabled(),
+                "native_wayland_allowed": crate::wayland::native_wayland_allowed(),
+                "hyprland": hyprland,
+                "atspi": atspi_ok,
+                "xsend_event": x11_ok
+            }))
     }
 }
 
@@ -3024,7 +3089,7 @@ impl Tool for GetAccessibilityTreeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let (procs, windows) = tokio::task::spawn_blocking(|| {
-            (crate::proc_fs::list_processes(), crate::x11::list_windows(None))
+            (crate::proc_fs::list_processes(), crate::wayland::list_windows_dispatch(None))
         }).await.unwrap_or_default();
 
         let mut lines = vec![format!(
@@ -3099,18 +3164,36 @@ impl Tool for ZoomTool {
         if x2 <= x1 || y2 <= y1 { return ToolResult::error("x2 must be > x1 and y2 must be > y1"); }
 
         let state = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(cursor_overlay::capture_utils::CropResult, Option<(f64, f64, f64)>)> {
+            if crate::wayland::is_hyprland_session() {
+                let png = crate::wayland::screenshot_dispatch(xid)?;
+                let monitor_scale = crate::wayland::hyprland_window_scale(xid)?;
+                let (origin_cx, origin_cy) = crate::wayland::hyprland_window_local_to_capture(xid, 0.0, 0.0)?;
+                let (cx1, cy1) = crate::wayland::hyprland_window_local_to_capture(xid, x1, y1)?;
+                let (cx2, cy2) = crate::wayland::hyprland_window_local_to_capture(xid, x2, y2)?;
+                let crop = cursor_overlay::capture_utils::crop_png_to_jpeg(&png, cx1, cy1, cx2, cy2, 500)?;
+                return Ok((crop, Some((origin_cx, origin_cy, monitor_scale))));
+            }
             let png = crate::capture::screenshot_window_bytes(xid)?;
-            cursor_overlay::capture_utils::crop_png_to_jpeg(&png, x1, y1, x2, y2, 500)
+            let crop = cursor_overlay::capture_utils::crop_png_to_jpeg(&png, x1, y1, x2, y2, 500)?;
+            Ok((crop, None))
         }).await;
 
         match result {
-            Ok(Ok(crop)) => {
+            Ok(Ok((crop, origin_offset))) => {
                 if let Some(p) = pid {
+                    let (origin_x, origin_y, scale_inv) = match origin_offset {
+                        Some((ox, oy, monitor_scale)) => (
+                            (crop.origin_x - ox) / monitor_scale,
+                            (crop.origin_y - oy) / monitor_scale,
+                            crop.scale_inv / monitor_scale,
+                        ),
+                        None => (crop.origin_x, crop.origin_y, crop.scale_inv),
+                    };
                     state.zoom_registry.set(p, ZoomContext {
-                        origin_x: crop.origin_x,
-                        origin_y: crop.origin_y,
-                        scale_inv: crop.scale_inv,
+                        origin_x,
+                        origin_y,
+                        scale_inv,
                     });
                 }
                 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -3172,7 +3255,7 @@ impl Tool for TypeTextCharsTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid))).await.unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(Some(pid))).await.unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => return ToolResult::error(format!("No windows found for pid {pid}. Provide window_id.")),
@@ -3181,6 +3264,10 @@ impl Tool for TypeTextCharsTool {
         };
         let text_len = text.chars().count();
         let result = tokio::task::spawn_blocking(move || {
+            if crate::wayland::is_wayland() {
+                crate::wayland::focus_window_for_input(xid)?;
+                return crate::wayland::type_text(&text);
+            }
             crate::input::send_type_text_with_delay(xid, &text, delay_ms)
         }).await;
         match result {

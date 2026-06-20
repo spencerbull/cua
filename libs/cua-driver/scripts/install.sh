@@ -26,6 +26,16 @@
 #   CUA_DRIVER_RS_INSTALL_DIR=PATH  same as --bin-dir
 #   CUA_DRIVER_BIN_DIR=PATH         legacy alias for --bin-dir
 #   CUA_DRIVER_NO_MODIFY_PATH=1     same as --no-modify-path
+#   CUA_DRIVER_SOURCE_REPO=owner/repo
+#   CUA_DRIVER_SOURCE_REF=branch-or-sha
+#                                  build and install cua-driver from a
+#                                  GitHub source archive instead of a
+#                                  published release. Useful for fork
+#                                  branches before release artifacts exist.
+#   CUA_DRIVER_INSTALL_REPO=owner/repo
+#   CUA_DRIVER_INSTALL_REF=branch-or-sha
+#                                  fetch the delegated Rust installer from
+#                                  a different raw GitHub repo/ref.
 #
 # Uninstall:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/uninstall.sh)"
@@ -38,6 +48,8 @@ TAG_PREFIX="cua-driver-v"
 APP_DEST="/Applications/$APP_NAME"
 BIN_DIR="${CUA_DRIVER_BIN_DIR:-$HOME/.local/bin}"
 NO_MODIFY_PATH="${CUA_DRIVER_NO_MODIFY_PATH:-0}"
+INSTALL_REPO="${CUA_DRIVER_INSTALL_REPO:-${CUA_DRIVER_REPO:-$REPO}}"
+INSTALL_REF="${CUA_DRIVER_INSTALL_REF:-${CUA_DRIVER_REF:-main}}"
 
 # Rust implementation delegation target. The Rust install logic is a private
 # helper script colocated with this one — _install-rust.sh — so that
@@ -45,7 +57,7 @@ NO_MODIFY_PATH="${CUA_DRIVER_NO_MODIFY_PATH:-0}"
 # The Rust path below either execs the on-disk helper (dev /
 # checked-out-tree case) or curls this URL and pipes it to bash
 # (`curl ... | bash` install case).
-RUST_INSTALLER_URL="https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/_install-rust.sh"
+RUST_INSTALLER_URL="${CUA_DRIVER_RUST_INSTALLER_URL:-https://raw.githubusercontent.com/${INSTALL_REPO}/${INSTALL_REF}/libs/cua-driver/scripts/_install-rust.sh}"
 
 # Lightweight flag parsing (avoid getopt; macOS getopt is GNU-incompatible).
 #
@@ -120,6 +132,41 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     fi
     if [[ -n "${CUA_DRIVER_NO_MODIFY_PATH:-}" && -z "${CUA_DRIVER_RS_NO_MODIFY_PATH:-}" ]]; then
         export CUA_DRIVER_RS_NO_MODIFY_PATH="$CUA_DRIVER_NO_MODIFY_PATH"
+    fi
+
+    SOURCE_REPO="${CUA_DRIVER_SOURCE_REPO:-${CUA_DRIVER_RS_SOURCE_REPO:-}}"
+    SOURCE_REF="${CUA_DRIVER_SOURCE_REF:-${CUA_DRIVER_RS_SOURCE_REF:-}}"
+    if [[ -n "$SOURCE_REPO" || -n "$SOURCE_REF" ]]; then
+        SOURCE_REPO="${SOURCE_REPO:-$REPO}"
+        SOURCE_REF="${SOURCE_REF:-main}"
+
+        for cmd in curl tar; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+                printf 'error: %s not found on PATH; cannot install from source\n' "$cmd" >&2
+                exit 1
+            fi
+        done
+
+        SOURCE_TMP="$(mktemp -d)"
+        cleanup_source_tmp() { rm -rf "$SOURCE_TMP" 2>/dev/null || true; }
+        trap cleanup_source_tmp EXIT
+
+        SOURCE_ARCHIVE="$SOURCE_TMP/source.tar.gz"
+        SOURCE_URL="https://codeload.github.com/${SOURCE_REPO}/tar.gz/${SOURCE_REF}"
+        printf 'note: installing cua-driver from source %s@%s.\n' "$SOURCE_REPO" "$SOURCE_REF" >&2
+        if ! curl -fsSL "$SOURCE_URL" -o "$SOURCE_ARCHIVE"; then
+            printf 'error: failed to download source archive from %s\n' "$SOURCE_URL" >&2
+            exit 1
+        fi
+        tar -xzf "$SOURCE_ARCHIVE" -C "$SOURCE_TMP"
+        SOURCE_ROOT="$(find "$SOURCE_TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+        SOURCE_INSTALLER="$SOURCE_ROOT/libs/cua-driver/scripts/install-local.sh"
+        if [[ -z "$SOURCE_ROOT" || ! -f "$SOURCE_INSTALLER" ]]; then
+            printf 'error: source archive did not contain libs/cua-driver/scripts/install-local.sh\n' >&2
+            exit 1
+        fi
+        /bin/bash "$SOURCE_INSTALLER" --release --backend=rust ${FORWARDED_ARGS[@]+"${FORWARDED_ARGS[@]}"}
+        exit $?
     fi
 
     # Prefer the on-disk copy when this script is running from a checked-out
