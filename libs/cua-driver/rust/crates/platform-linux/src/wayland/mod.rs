@@ -189,6 +189,12 @@ struct HyprCursor {
     y: i32,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct HyprActiveWindow {
+    #[serde(default)]
+    address: String,
+}
+
 fn default_scale() -> f64 { 1.0 }
 
 fn hyprctl_json<T: for<'de> Deserialize<'de>>(args: &[&str]) -> anyhow::Result<T> {
@@ -217,6 +223,10 @@ fn hypr_clients() -> anyhow::Result<Vec<HyprClient>> {
 
 fn hypr_monitors() -> anyhow::Result<Vec<HyprMonitor>> {
     hyprctl_json(&["monitors"])
+}
+
+fn hypr_active_window() -> anyhow::Result<HyprActiveWindow> {
+    hyprctl_json(&["activewindow"])
 }
 
 fn hypr_monitor_logical_size(monitor: &HyprMonitor) -> (u32, u32) {
@@ -269,10 +279,27 @@ fn hypr_focus_window(address: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn hypr_wait_for_focus(address: &str) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    loop {
+        if hypr_active_window()
+            .map(|w| w.address.eq_ignore_ascii_case(address))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("Hyprland did not focus window {address}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+}
+
 pub fn focus_window_for_input(window_id: u64) -> anyhow::Result<()> {
     if is_hyprland_session() {
         let client = hypr_client_for_window(window_id)?;
         hypr_focus_window(&client.address)?;
+        hypr_wait_for_focus(&client.address)?;
     }
     Ok(())
 }
@@ -401,6 +428,7 @@ struct State {
     vptr_manager: Option<ZwlrVirtualPointerManagerV1>,
     output_w: u32,
     output_h: u32,
+    outputs_by_name: HashMap<String, WlOutput>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -446,16 +474,22 @@ impl Dispatch<WlSeat, ()> for State {
 impl Dispatch<WlOutput, ()> for State {
     fn event(
         state: &mut Self,
-        _: &WlOutput,
+        output: &WlOutput,
         event: wl_output::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         // Remember the output resolution so `click` can aim at its centre.
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            state.output_w = width.max(0) as u32;
-            state.output_h = height.max(0) as u32;
+        match event {
+            wl_output::Event::Mode { width, height, .. } => {
+                state.output_w = width.max(0) as u32;
+                state.output_h = height.max(0) as u32;
+            }
+            wl_output::Event::Name { name } => {
+                state.outputs_by_name.insert(name, output.clone());
+            }
+            _ => {}
         }
     }
 }
@@ -608,6 +642,7 @@ fn virtual_pointer_click(
     state: &mut State,
     qh: &QueueHandle<State>,
     queue: &mut wayland_client::EventQueue<State>,
+    output: Option<&WlOutput>,
     x: u32,
     y: u32,
     width: u32,
@@ -624,7 +659,10 @@ fn virtual_pointer_click(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("compositor does not expose zwlr_virtual_pointer_manager_v1"))?;
     let button = evdev_button(button as u32);
-    let vptr = mgr.create_virtual_pointer(Some(&seat), qh, ());
+    let vptr = match output {
+        Some(output) => mgr.create_virtual_pointer_with_output(Some(&seat), Some(output), qh, ()),
+        None => mgr.create_virtual_pointer(Some(&seat), qh, ()),
+    };
     vptr.motion_absolute(0, x.min(width.saturating_sub(1)), y.min(height.saturating_sub(1)), width.max(1), height.max(1));
     vptr.frame();
     for _ in 0..count.max(1) {
@@ -667,15 +705,35 @@ pub fn click_at(window_id: u64, x: f64, y: f64, count: usize, button: u8) -> any
             queue.roundtrip(&mut state)?; // drain seat / virtual-pointer / output mode events
         }
         let client = hypr_client_for_window(window_id)?;
-        hypr_focus_window(&client.address)?;
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        let (min_x, min_y, width, height) =
-            hypr_layout_bounds().unwrap_or((0, 0, state.output_w.max(1), state.output_h.max(1)));
         let global_x = client.at[0] as f64 + x.clamp(0.0, client.size[0].saturating_sub(1) as f64);
         let global_y = client.at[1] as f64 + y.clamp(0.0, client.size[1].saturating_sub(1) as f64);
+        let target_monitor = hypr_monitor_for_logical_point(global_x, global_y).ok();
+        hypr_focus_window(&client.address)?;
+        hypr_wait_for_focus(&client.address)?;
+        if let Some(monitor) = target_monitor.as_ref() {
+            if let Some(output) = state.outputs_by_name.get(&monitor.name).cloned() {
+                let (width, height) = hypr_monitor_logical_size(monitor);
+                let vx = (global_x - monitor.x as f64).round().max(0.0) as u32;
+                let vy = (global_y - monitor.y as f64).round().max(0.0) as u32;
+                return virtual_pointer_click(
+                    &mut state,
+                    &qh,
+                    &mut queue,
+                    Some(&output),
+                    vx,
+                    vy,
+                    width,
+                    height,
+                    button,
+                    count,
+                );
+            }
+        }
+        let (min_x, min_y, width, height) =
+            hypr_layout_bounds().unwrap_or((0, 0, state.output_w.max(1), state.output_h.max(1)));
         let vx = (global_x - min_x as f64).round().max(0.0) as u32;
         let vy = (global_y - min_y as f64).round().max(0.0) as u32;
-        return virtual_pointer_click(&mut state, &qh, &mut queue, vx, vy, width, height, button, count);
+        return virtual_pointer_click(&mut state, &qh, &mut queue, None, vx, vy, width, height, button, count);
     }
 
     if state.manager.is_none() {
@@ -700,7 +758,7 @@ pub fn click_at(window_id: u64, x: f64, y: f64, count: usize, button: u8) -> any
 
     // Land a button press at the output centre (over the now-focused window).
     let (w, h) = (state.output_w.max(1), state.output_h.max(1));
-    virtual_pointer_click(&mut state, &qh, &mut queue, w / 2, h / 2, w, h, button, count)
+    virtual_pointer_click(&mut state, &qh, &mut queue, None, w / 2, h / 2, w, h, button, count)
 }
 
 /// Type Unicode text into the focused Wayland surface via `wtype` (the
