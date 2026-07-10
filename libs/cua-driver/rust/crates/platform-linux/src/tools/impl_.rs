@@ -526,7 +526,7 @@ impl Tool for GetWindowStateTool {
             input_schema: json!({"type":"object","required":["pid","window_id"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "pid":{"type":"integer"},
-                "window_id":{"type":"integer","description":"X11 XID from list_windows."},
+                "window_id":{"type":"integer","description":"Opaque window id from list_windows; do not derive or reuse across daemon restarts."},
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_screenshot":{"type":"boolean",
                     "description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},
@@ -635,14 +635,32 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
-            Ok((tree_result, screenshot, bounds))
+            let hypr_metadata =
+                if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                    // Additive metadata must not discard a successfully
+                    // collected tree-only response when a window closes.
+                    crate::wayland::hyprland::window_metadata(xid).ok()
+                } else {
+                    None
+                };
+            Ok((tree_result, screenshot, bounds, hypr_metadata))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds))) => {
+            Ok(Ok((tree_opt, shot_opt, bounds, hypr_metadata))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
+                if let Some(((origin_x, origin_y), scale)) = hypr_metadata {
+                    structured["screenshot_coordinate_space"] = json!("window_local_image_pixels");
+                    structured["element_frame_coordinate_space"] = json!("global_logical");
+                    structured["window_origin"] = json!({ "x": origin_x, "y": origin_y });
+                    structured["capture_scale_factor"] = json!(scale);
+                    structured["capture_semantics"] = json!("visible_compositor_region");
+                    structured["capture_note"] = json!(
+                        "Hyprland per-window capture is a compositor crop of the visible screen region; an overlapping window can appear in the image."
+                    );
+                }
 
                 if let Some(tr) = tree_opt {
                     let count = tr
@@ -763,10 +781,14 @@ impl Tool for GetWindowStateTool {
                 if let Some((b64_opt, file_path, w, h, orig_w)) = shot_opt {
                     if let Some(ow) = orig_w {
                         if w > 0 {
-                            state.resize_registry.set_ratio(pid, ow as f64 / w as f64);
+                            let ratio = ow as f64 / w as f64;
+                            state.resize_registry.set_ratio(pid, ratio);
+                            structured["screenshot_original_width"] = json!(ow);
+                            structured["action_coordinate_multiplier"] = json!(ratio);
                         }
                     } else {
                         state.resize_registry.clear_ratio(pid);
+                        structured["action_coordinate_multiplier"] = json!(1.0);
                     }
                     // ax mode + screenshot_out_file writes the PNG to disk and
                     // returns b64=None — never embed the image bytes in that case.
@@ -881,7 +903,7 @@ impl Tool for LaunchAppTool {
             Ok(Ok((message, pid_opt, name))) => {
                 if let Some(pid) = pid_opt {
                     let windows = tokio::task::spawn_blocking(move || {
-                        crate::x11::list_windows(Some(pid))
+                        crate::wayland::list_windows_dispatch(Some(pid))
                             .iter()
                             .map(window_record_json)
                             .collect::<Vec<_>>()
@@ -933,12 +955,22 @@ fn resolve_element_local_coords(
     let xid = if let Some(x) = xid_hint {
         x
     } else {
-        crate::x11::list_windows(Some(pid))
+        crate::wayland::list_windows_dispatch(Some(pid))
             .into_iter()
             .next()
             .map(|w| w.xid)
             .ok_or_else(|| anyhow::anyhow!("No windows for pid {pid}"))?
     };
+
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        let (origin_x, origin_y) = crate::wayland::hyprland::window_origin(xid)?;
+        let scale = crate::wayland::hyprland::window_scale(xid)?;
+        return Ok((
+            xid,
+            (screen_cx - origin_x as f64) * scale,
+            (screen_cy - origin_y as f64) * scale,
+        ));
+    }
 
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
@@ -959,6 +991,10 @@ fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        return crate::wayland::hyprland::capture_to_screen(xid, x, y);
+    }
+
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
     use x11rb::rust_connection::RustConnection;
@@ -976,6 +1012,19 @@ fn parse_mouse_button(name: &str) -> u8 {
         "right" => 3,
         "middle" => 2,
         _ => 1,
+    }
+}
+
+fn hyprland_focus_required(delivery: crate::input::delivery::DeliveryMode) -> Option<ToolResult> {
+    if crate::wayland::is_wayland()
+        && crate::wayland::hyprland::is_session()
+        && !delivery.is_foreground()
+    {
+        Some(crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::BackgroundUnavailable::HyprlandNeedsFocus,
+        ))
+    } else {
+        None
     }
 }
 
@@ -1422,6 +1471,12 @@ fn terminal_tty_for_window(pid: u32, xid: u64) -> Option<PathBuf> {
     if !is_terminal_process(pid) {
         return None;
     }
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        // Hyprland window ids are surrogate registry keys, not X11 XIDs; they
+        // cannot be ordered against x11::list_windows to infer a pty. Let the
+        // focused wtype path handle native/XWayland terminals instead.
+        return None;
+    }
     let mut windows = crate::x11::list_windows(Some(pid));
     windows.sort_by_key(|w| w.xid);
     let window_index = windows.iter().position(|w| w.xid == xid)?;
@@ -1473,9 +1528,8 @@ impl Tool for ClickTool {
                 back to full-window space.\n\n\
                 button: \"left\" (default), \"right\", or \"middle\". Defaults to left so the \
                 field is fully back-compat. X11: routes through XSendEvent ButtonPress/Release \
-                with the matching button code. Native Wayland: only left-button is supported \
-                via the virtual-pointer protocol — right/middle return an error rather than \
-                silently degrading to left.".into(),
+                with the matching button code. Native wlroots/Hyprland Wayland routes all three \
+                buttons through the virtual-pointer protocol.".into(),
             input_schema: json!({
                 // `pid` is conditionally required (validated in code: needed for
                 // window/element clicks, omitted for windowless scope="desktop"),
@@ -1493,7 +1547,7 @@ impl Tool for ClickTool {
                     // Shape matches the shared button_schema() canon (string +
                     // [left,right,middle]); kept inline to carry the Linux/Wayland
                     // back-compat prose the click button-schema test asserts on.
-                    "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button. Default: \"left\" (legacy back-compat). X11: routed via ButtonPress/Release with the matching evdev code. Native Wayland: only left-button is supported via the virtual-pointer protocol; right/middle return an error."},
+                    "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button. Default: \"left\" (legacy back-compat). X11 uses the matching button code; native wlroots/Hyprland Wayland uses the matching evdev virtual-pointer button."},
                     "count":{"type":"integer"},
                     "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
                     "delivery_mode": crate::input::delivery::delivery_mode_schema()
@@ -1505,6 +1559,7 @@ impl Tool for ClickTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let cursor_id = resolve_cursor_key(&args);
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
 
         // ── Window-less screen-absolute branch (capture_scope="desktop") ──────
         // x,y with NO pid and NO window_id → TRUE SCREEN pixels. Foreground,
@@ -1550,20 +1605,47 @@ impl Tool for ClickTool {
             // / Windows desktop paths already do this). Without it the overlay
             // sits idle elsewhere while only the real pointer warps, so a viewer
             // sees the cursor "click somewhere else."
-            overlay_glide_to_for(&cursor_id, sx as f64, sy as f64).await;
-            let r = tokio::task::spawn_blocking(move || {
-                crate::input::send_click_xtest_desktop(sx, sy, button, n)
+            let is_hyprland =
+                crate::wayland::is_wayland() && crate::wayland::hyprland::is_session();
+            let overlay_point = if is_hyprland {
+                match tokio::task::spawn_blocking(move || {
+                    crate::wayland::hyprland::desktop_capture_to_screen(
+                        f64::from(sx),
+                        f64::from(sy),
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(point)) => point,
+                    Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                    Err(error) => return ToolResult::error(format!("task error: {error}")),
+                }
+            } else {
+                (f64::from(sx), f64::from(sy))
+            };
+            overlay_glide_to_for(&cursor_id, overlay_point.0, overlay_point.1).await;
+            let r = tokio::task::spawn_blocking(move || -> anyhow::Result<&'static str> {
+                if is_hyprland {
+                    crate::wayland::click_desktop_capture(sx, sy, n as u32, button)?;
+                    Ok("hyprland_virtual_pointer")
+                } else {
+                    crate::input::send_click_xtest_desktop(sx, sy, button, n)?;
+                    Ok("xtest_desktop")
+                }
             })
             .await;
             return match r {
                 // Screen-absolute XTEST click — never driver-verifiable (no
                 // read-back); the caller confirms via screenshot.
-                Ok(Ok(())) => ToolResult::text(format!(
+                Ok(Ok(path)) => ToolResult::text(format!(
                     "✅ Sent screen-absolute click at ({sx},{sy}) (desktop scope)."
                 ))
-                .with_structured(
-                    json!({ "path": "xtest_desktop", "verified": false, "effect": "unverifiable" }),
-                ),
+                .with_structured(json!({
+                    "path": path,
+                    "verified": false,
+                    "effect": "unverifiable",
+                    "coordinate_space": "desktop_capture_physical",
+                })),
                 Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
             };
@@ -1629,7 +1711,7 @@ impl Tool for ClickTool {
                 let (cx, cy) = element_screen_center(pid, idx).unwrap_or((0.0, 0.0));
                 let xid = xid_hint
                     .or_else(|| {
-                        crate::x11::list_windows(Some(pid))
+                        crate::wayland::list_windows_dispatch(Some(pid))
                             .into_iter()
                             .next()
                             .map(|w| w.xid)
@@ -1661,12 +1743,32 @@ impl Tool for ClickTool {
                     if let Ok((_action, suspected_noop)) = crate::atspi::perform_action(pid, idx) {
                         return Ok(("ax", suspected_noop));
                     }
+                    if crate::wayland::is_wayland()
+                        && crate::wayland::hyprland::is_session()
+                        && !delivery.is_foreground()
+                    {
+                        return Ok(("hyprland_background_unavailable", false));
+                    }
                     let (xid2, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
+                    if crate::wayland::is_wayland() {
+                        crate::wayland::click(
+                            xid2,
+                            Some((lx.round() as i32, ly.round() as i32)),
+                            count as u32,
+                            button,
+                        )?;
+                        return Ok(("wayland_activate", false));
+                    }
                     crate::input::send_click(xid2, lx as i32, ly as i32, count, button)?;
                     Ok(("x11_pixel", false))
                 })
                 .await;
             return match result {
+                Ok(Ok(("hyprland_background_unavailable", _))) => {
+                    crate::input::delivery::background_unavailable_error(
+                        crate::input::delivery::BackgroundUnavailable::HyprlandNeedsFocus,
+                    )
+                }
                 // An element click is never driver-verifiable (no read-back) —
                 // verified:false; the caller confirms via screenshot. `effect` is
                 // the richer signal: a passive/role-mismatched AT-SPI actuation is
@@ -1694,6 +1796,14 @@ impl Tool for ClickTool {
             Some(v) => v,
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
+        let coordinates_provided = match (
+            args.get("x").and_then(Value::as_f64),
+            args.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => return ToolResult::error("click requires both x and y when either is provided."),
+        };
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
@@ -1715,23 +1825,44 @@ impl Tool for ClickTool {
             y *= ratio;
         }
 
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
+
         crate::overlay::send_command_for(
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        // Resolve the screen point the cursor glides to. On native Wayland the
-        // agent already passes screen coordinates (the vision screenshot and
-        // `get_window_state` frames are screen-space, and `window_local_to_screen`
-        // — an X11 `translate_coordinates` call — can't run with DISPLAY unset),
-        // so use them directly. On X11 the coords are window-local; translate.
-        let glide_target = if crate::wayland::is_wayland() {
-            Some((x, y))
+        // Hyprland returns a window-geometry crop of the visible compositor
+        // image. Its coordinates are window-local image pixels and must be
+        // converted back to global logical coordinates for the overlay and
+        // AT-SPI hit-test. Generic Wayland still returns output-space coords.
+        let overlay_local = if crate::wayland::is_wayland()
+            && crate::wayland::hyprland::is_session()
+            && !coordinates_provided
+        {
+            tokio::task::spawn_blocking(move || {
+                crate::wayland::hyprland::window_capture_center(xid)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or((x, y))
         } else {
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y))
+            (x, y)
+        };
+        let glide_target =
+            if crate::wayland::is_wayland() && !crate::wayland::hyprland::is_session() {
+                Some(overlay_local)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    window_local_to_screen(xid, overlay_local.0, overlay_local.1)
+                })
                 .await
                 .ok()
                 .and_then(|r| r.ok())
-        };
+            };
+        let wayland_screen_point = glide_target.unwrap_or((x, y));
         if let Some((sx, sy)) = glide_target {
             overlay_glide_to_for(&cursor_id, sx, sy).await;
             crate::overlay::send_command_for(
@@ -1741,11 +1872,15 @@ impl Tool for ClickTool {
         }
 
         let (xi, yi) = (x as i32, y as i32);
+        let (screen_xi, screen_yi) = (
+            wayland_screen_point.0.round() as i32,
+            wayland_screen_point.1.round() as i32,
+        );
         let cursor_id_for_task = cursor_id.clone();
         // delivery_mode: background (default) = no-focus-steal injection;
         // foreground = activate the target window (EWMH) first, then inject,
-        // then restore prior active. Mirrors macOS/Windows.
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        // then restore prior active where supported. Hyprland deliberately
+        // leaves the verified target focused; see input::delivery.
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<&'static str> {
             if crate::wayland::is_wayland() {
                 // Vision/pixel click on native Wayland. Mutter drops synthetic
@@ -1755,9 +1890,15 @@ impl Tool for ClickTool {
                 // `element_index` — the coordinate-free path already verified
                 // working. (x,y) are screen coords here, matching the frames in
                 // `get_window_state`. Miss → fall through to the injection paths.
-                if button == 1 && count == 1 {
+                // Mutter needs the AT-SPI coordinate fallback because it drops
+                // synthetic pointer events. Hyprland exposes a real
+                // output-bound virtual-pointer path; using the fallback there
+                // would often match the root window's generic `activate`
+                // action and falsely report a pixel click without pressing the
+                // control under the requested coordinate.
+                if button == 1 && count == 1 && !crate::wayland::hyprland::is_session() {
                     if let Ok(Some(_)) =
-                        crate::atspi::perform_action_at_screen_point(pid, xid, xi, yi)
+                        crate::atspi::perform_action_at_screen_point(pid, xid, screen_xi, screen_yi)
                     {
                         return Ok("wayland_atspi");
                     }
@@ -1769,7 +1910,8 @@ impl Tool for ClickTool {
                 // Native Wayland: focus+raise the target toplevel
                 // (foreign-toplevel `activate`), then drive `count` virtual-pointer
                 // button events. Wayland injection routes to the compositor focus.
-                crate::wayland::click(xid, xi, yi, count as u32, button)?;
+                let point = coordinates_provided.then_some((xi, yi));
+                crate::wayland::click(xid, point, count as u32, button)?;
                 return Ok("wayland_activate");
             }
             // X11 injection. Tiered no-focus-steal delivery (background):
@@ -1841,7 +1983,7 @@ impl Tool for ClickTool {
 /// `Ok(())` on success; `Err(ToolResult)` short-circuits the caller.
 ///
 /// Mirrors macOS `tools::focus_by_pixel`. Linux differences: `pid` is `u32`,
-/// `window_id` is `u64` (the X11 XID / window id), and there is no `_session_id`
+/// `window_id` is the opaque `u64` returned by list_windows, and there is no `_session_id`
 /// field — the Linux ClickTool resolves the agent cursor from `session` /
 /// `cursor_id` only (`resolve_cursor_key`).
 async fn focus_by_pixel(
@@ -1873,9 +2015,7 @@ async fn focus_by_pixel(
     .invoke(click_args)
     .await;
     if focus.is_error == Some(true) {
-        return Err(ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
-        )));
+        return Err(focus);
     }
     // Brief settle so the renderer registers focus before the keystrokes.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -1923,6 +2063,7 @@ impl Tool for TypeTextTool {
         // cua_driver_core::text_sanitize docs for rationale.
         let text = cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&text_raw)
             .into_owned();
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         // Surface 6: resolve element_token / element_index for the
         // optional pre-typing focus glide below. The token also carries
         // the window_id when supplied so the caller can omit window_id.
@@ -1950,10 +2091,11 @@ impl Tool for TypeTextTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -1980,7 +2122,7 @@ impl Tool for TypeTextTool {
                     "Pass either element_index (ax) or x,y (px) to type_text, not both.",
                 );
             }
-            let fg = crate::input::delivery::DeliveryMode::from_args(&args).is_foreground();
+            let fg = delivery.is_foreground();
             let from_zoom = args.bool_or("from_zoom", false);
             if let Err(e) = focus_by_pixel(
                 &self.state,
@@ -2022,23 +2164,42 @@ impl Tool for TypeTextTool {
             };
         }
 
+        if crate::wayland::is_wayland()
+            && crate::wayland::hyprland::is_session()
+            && !delivery.is_foreground()
+        {
+            // The generic AT-SPI editable helper is pid-scoped and can choose
+            // another window in a multi-window app. Do not trade focus safety
+            // for target ambiguity; require explicit foreground delivery.
+            return crate::input::delivery::background_unavailable_error(
+                crate::input::delivery::BackgroundUnavailable::HyprlandNeedsFocus,
+            );
+        }
+
         // Native Wayland: keys go to the *focused* surface (no pid/window
         // targeting in the protocol). Type via the virtual-keyboard tool; pair
         // with a prior `click`/`activate` to focus the intended window.
         if crate::wayland::is_wayland() {
             let text_len = text.chars().count();
             let text_w = text.clone();
-            let result =
-                tokio::task::spawn_blocking(move || crate::wayland::type_text(&text_w)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::wayland::focus_window_for_input(xid)?;
+                crate::wayland::type_text(&text_w)
+            })
+            .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
-                ))
-                .with_structured(type_text_structured(
-                    "key_events",
-                    text_len,
-                    false,
-                )),
+                Ok(Ok(())) => {
+                    let path = if delivery.is_foreground() {
+                        "key_events_fg"
+                    } else {
+                        "key_events"
+                    };
+                    ToolResult::text(format!(
+                        "Typed {text_len} character(s) (via Wayland virtual-keyboard, delivery_mode={}).",
+                        if delivery.is_foreground() { "foreground" } else { "background" }
+                    ))
+                    .with_structured(type_text_structured(path, text_len, false))
+                }
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -2200,7 +2361,6 @@ impl Tool for TypeTextTool {
         // foreground = activate the window (EWMH), then synthesize REAL key
         // events to it via XTest — the escalation when background didn't land
         // (e.g. a GTK dialog whose widget ignores synthetic XSendEvent keys).
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<&'static str> {
             // Terminals: write to the pty master (focus-free, below the toolkit).
             if inject_terminal_input(pid, xid, &text)? {
@@ -2324,10 +2484,11 @@ impl Tool for PressKeyTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -2344,6 +2505,9 @@ impl Tool for PressKeyTool {
         // background path (the focus-click already handled fronting when fg). Pass x,y
         // (no element_index) for Chromium/Electron surfaces the AX path can't focus.
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
 
         // An element-addressed keypress needs to establish the target's
         // focus before the window-level X11 key event is sent. AT-SPI's
@@ -2415,8 +2579,11 @@ impl Tool for PressKeyTool {
         // Native Wayland: send the key to the focused surface via virtual-keyboard.
         if crate::wayland::is_wayland() {
             let key_w = key.clone();
-            let result =
-                tokio::task::spawn_blocking(move || crate::wayland::press_key(&key_w)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::wayland::focus_window_for_input(xid)?;
+                crate::wayland::press_key(&key_w)
+            })
+            .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Pressed key '{key}' (via Wayland virtual-keyboard)."
@@ -2525,10 +2692,11 @@ impl Tool for HotkeyTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -2565,6 +2733,9 @@ impl Tool for HotkeyTool {
         let key_for_wayland = key.clone();
         let mods_for_wayland = mods.clone();
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
 
         // X11 can address an unfocused native window with synthetic events, but
         // Chromium's renderer only processes modifier chords for its focused
@@ -2617,6 +2788,7 @@ impl Tool for HotkeyTool {
                 // state-mask path. window_id is irrelevant once focused.
                 let mut combo: Vec<String> = mods_for_wayland.clone();
                 combo.push(key_for_wayland.clone());
+                crate::wayland::focus_window_for_input(xid)?;
                 return crate::wayland::hotkey(&combo);
             }
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
@@ -2745,8 +2917,11 @@ impl Tool for ScrollTool {
     fn def(&self) -> &ToolDef {
         SCROLL_DEF.get_or_init(|| ToolDef {
             name: "scroll".into(),
-            description: "Scroll the target pid's focused region via XSendEvent Button4/5. \
-                direction required; by defaults to line, amount defaults to 3.".into(),
+            description: "Scroll the target pid's focused region. X11 uses background input by \
+                default. On native Hyprland, element-addressed background scrolling first tries \
+                AT-SPI; virtual-pointer scrolling requires delivery_mode=foreground because the \
+                compositor routes input to its focused window. direction required; by defaults \
+                to line, amount defaults to 3.".into(),
             input_schema: json!({
                 // `pid` is conditionally required (validated in code), so only
                 // `direction` is pinned — matches the scroll→["direction"] canon
@@ -2805,10 +2980,11 @@ impl Tool for ScrollTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -2843,6 +3019,10 @@ impl Tool for ScrollTool {
                     }));
                 }
             }
+        }
+
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
         }
 
         // An element-addressed scroll must land over the element. The old
@@ -2972,9 +3152,11 @@ impl Tool for DoubleClickTool {
     fn def(&self) -> &ToolDef {
         DCLICK_DEF.get_or_init(|| ToolDef {
             name: "double_click".into(),
-            description: "Double-click at (x,y) or an element_index (AT-SPI bounds) via XSendEvent. \
-                No focus steal. Provide either (window_id + x/y) or (pid + element_index). \
-                After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.".into(),
+            description: "Double-click at (x,y) or an element_index (AT-SPI bounds). X11 uses \
+                background XSendEvent by default. Native Hyprland requires \
+                delivery_mode=foreground because virtual-pointer input routes through compositor \
+                focus. Provide either (window_id + x/y) or (pid + element_index). After a zoom \
+                call, pass from_zoom=true to auto-translate zoom-image coords.".into(),
             input_schema: json!({"type":"object","required":["pid"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -2996,6 +3178,10 @@ impl Tool for DoubleClickTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
         // Surface 6: element_token / element_index precedence.
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid as i32,
@@ -3045,7 +3231,7 @@ impl Tool for DoubleClickTool {
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result = tokio::task::spawn_blocking(move || {
                         if crate::wayland::is_wayland() {
-                            return crate::wayland::click(xid, lxi, lyi, 2, 1);
+                            return crate::wayland::click(xid, Some((lxi, lyi)), 2, 1);
                         }
                         x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, lxi, lyi, 1, 2)
                     })
@@ -3065,6 +3251,18 @@ impl Tool for DoubleClickTool {
         let xid = match window_id_resolved {
             Some(v) => v,
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
+        };
+        let coordinates_provided = match (
+            args.get("x").and_then(Value::as_f64),
+            args.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => {
+                return ToolResult::error(
+                    "double_click requires both x and y when either is provided.",
+                )
+            }
         };
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
@@ -3090,19 +3288,31 @@ impl Tool for DoubleClickTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        // Resolve the screen point the cursor glides to. On native Wayland the
-        // agent already passes screen coordinates (the vision screenshot and
-        // `get_window_state` frames are screen-space, and `window_local_to_screen`
-        // — an X11 `translate_coordinates` call — can't run with DISPLAY unset),
-        // so use them directly. On X11 the coords are window-local; translate.
-        let glide_target = if crate::wayland::is_wayland() {
-            Some((x, y))
+        let overlay_local = if crate::wayland::is_wayland()
+            && crate::wayland::hyprland::is_session()
+            && !coordinates_provided
+        {
+            tokio::task::spawn_blocking(move || {
+                crate::wayland::hyprland::window_capture_center(xid)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or((x, y))
         } else {
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y))
+            (x, y)
+        };
+        let glide_target =
+            if crate::wayland::is_wayland() && !crate::wayland::hyprland::is_session() {
+                Some(overlay_local)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    window_local_to_screen(xid, overlay_local.0, overlay_local.1)
+                })
                 .await
                 .ok()
                 .and_then(|r| r.ok())
-        };
+            };
         if let Some((sx, sy)) = glide_target {
             overlay_glide_to_for(&cursor_id, sx, sy).await;
             crate::overlay::send_command_for(
@@ -3112,10 +3322,9 @@ impl Tool for DoubleClickTool {
         }
         let (xi, yi) = (x as i32, y as i32);
         let cursor_id_for_task = cursor_id.clone();
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if crate::wayland::is_wayland() {
-                return crate::wayland::click(xid, xi, yi, 2, 1);
+                return crate::wayland::click(xid, coordinates_provided.then_some((xi, yi)), 2, 1);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -3166,9 +3375,11 @@ impl Tool for RightClickTool {
     fn def(&self) -> &ToolDef {
         RCLICK_DEF.get_or_init(|| ToolDef {
             name: "right_click".into(),
-            description: "Right-click at (x,y) or an element_index (AT-SPI bounds) via XSendEvent. \
-                No focus steal. Provide either (window_id + x/y) or (pid + element_index). \
-                After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.".into(),
+            description: "Right-click at (x,y) or an element_index (AT-SPI bounds). X11 uses \
+                background XSendEvent by default. Native Hyprland requires \
+                delivery_mode=foreground because virtual-pointer input routes through compositor \
+                focus. Provide either (window_id + x/y) or (pid + element_index). After a zoom \
+                call, pass from_zoom=true to auto-translate zoom-image coords.".into(),
             input_schema: json!({"type":"object","required":["pid"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -3191,6 +3402,10 @@ impl Tool for RightClickTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
         // Surface 6: element_token / element_index precedence.
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid as i32,
@@ -3240,7 +3455,7 @@ impl Tool for RightClickTool {
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result = tokio::task::spawn_blocking(move || {
                         if crate::wayland::is_wayland() {
-                            return crate::wayland::click(xid, lxi, lyi, 1, 3);
+                            return crate::wayland::click(xid, Some((lxi, lyi)), 1, 3);
                         }
                         x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, lxi, lyi, 3, 1)
                     })
@@ -3260,6 +3475,18 @@ impl Tool for RightClickTool {
         let xid = match window_id_resolved {
             Some(v) => v,
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
+        };
+        let coordinates_provided = match (
+            args.get("x").and_then(Value::as_f64),
+            args.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => {
+                return ToolResult::error(
+                    "right_click requires both x and y when either is provided.",
+                )
+            }
         };
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
@@ -3285,19 +3512,31 @@ impl Tool for RightClickTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        // Resolve the screen point the cursor glides to. On native Wayland the
-        // agent already passes screen coordinates (the vision screenshot and
-        // `get_window_state` frames are screen-space, and `window_local_to_screen`
-        // — an X11 `translate_coordinates` call — can't run with DISPLAY unset),
-        // so use them directly. On X11 the coords are window-local; translate.
-        let glide_target = if crate::wayland::is_wayland() {
-            Some((x, y))
+        let overlay_local = if crate::wayland::is_wayland()
+            && crate::wayland::hyprland::is_session()
+            && !coordinates_provided
+        {
+            tokio::task::spawn_blocking(move || {
+                crate::wayland::hyprland::window_capture_center(xid)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or((x, y))
         } else {
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y))
+            (x, y)
+        };
+        let glide_target =
+            if crate::wayland::is_wayland() && !crate::wayland::hyprland::is_session() {
+                Some(overlay_local)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    window_local_to_screen(xid, overlay_local.0, overlay_local.1)
+                })
                 .await
                 .ok()
                 .and_then(|r| r.ok())
-        };
+            };
         if let Some((sx, sy)) = glide_target {
             overlay_glide_to_for(&cursor_id, sx, sy).await;
             crate::overlay::send_command_for(
@@ -3307,10 +3546,9 @@ impl Tool for RightClickTool {
         }
         let (xi, yi) = (x as i32, y as i32);
         let cursor_id_for_task = cursor_id.clone();
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if crate::wayland::is_wayland() {
-                return crate::wayland::click(xid, xi, yi, 1, 3);
+                return crate::wayland::click(xid, coordinates_provided.then_some((xi, yi)), 1, 3);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -3361,8 +3599,9 @@ impl Tool for DragTool {
         DRAG_DEF.get_or_init(|| ToolDef {
             name: "drag".into(),
             description: "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in \
-                          window-local screenshot pixels via XSendEvent (ButtonPress + MotionNotify × steps + ButtonRelease). \
-                          duration_ms (default 500), steps (default 20). No focus steal.".into(),
+                          window-local screenshot pixels. X11 uses background XSendEvent; native \
+                          Hyprland requires delivery_mode=foreground because virtual-pointer input \
+                          routes through compositor focus. duration_ms defaults to 500 and steps to 20.".into(),
             input_schema: json!({"type":"object","required":["pid","from_x","from_y","to_x","to_y"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -3376,7 +3615,8 @@ impl Tool for DragTool {
                 "steps":{"type":"integer","minimum":1,"maximum":200,"description":"Intermediate MotionNotify events. Default: 20."},
                 "modifier": cua_driver_core::tool_schema::modifier_schema(),
                 "button": cua_driver_core::tool_schema::button_schema(),
-                "from_zoom":{"type":"boolean"}
+                "from_zoom":{"type":"boolean"},
+                "delivery_mode": crate::input::delivery::delivery_mode_schema()
             },"additionalProperties":false}),
             read_only: false, destructive: true, idempotent: false, open_world: true,
         })
@@ -3391,6 +3631,10 @@ impl Tool for DragTool {
             Some(v) => v,
             None => return ToolResult::error("window_id is required on Linux."),
         };
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
 
         let coerce = |key: &str| -> Option<f64> {
             args.opt_f64(key)
@@ -3625,9 +3869,10 @@ impl Tool for MouseButtonDownTool {
     fn def(&self) -> &ToolDef {
         MDOWN_DEF.get_or_init(|| ToolDef {
             name: "mouse_button_down".into(),
-            description: "Press and hold a mouse button at (x,y) via background X11 delivery. \
-                Does not release the button; pair with mouse_drag / mouse_button_up. \
-                Returns the current held-button state.".into(),
+            description: "Press and hold a mouse button at (x,y). X11 uses background delivery; \
+                native Hyprland requires delivery_mode=foreground because the virtual pointer \
+                targets compositor focus. Does not release the button; pair with mouse_drag / \
+                mouse_button_up. Returns the current held-button state.".into(),
             input_schema: json!({"type":"object","required":["pid","window_id","x","y"],"properties":{
                 "session":{"type":"string","description":"Optional multi-cursor session id; takes precedence over cursor_id."},
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -3636,7 +3881,8 @@ impl Tool for MouseButtonDownTool {
                 "x":{"type":"number"},
                 "y":{"type":"number"},
                 "button": cua_driver_core::tool_schema::button_schema(),
-                "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."}
+                "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
+                "delivery_mode": crate::input::delivery::delivery_mode_schema()
             },"additionalProperties":false}),
             read_only: false, destructive: true, idempotent: false, open_world: true,
         })
@@ -3666,6 +3912,10 @@ impl Tool for MouseButtonDownTool {
             Some(v) => v,
             None => return ToolResult::error("window_id is required on Linux."),
         };
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
         let button_name = args.str_or("button", "left");
         let button = parse_mouse_button(button_name.as_str());
         let mut x = args.f64_or("x", 0.0);
@@ -3773,9 +4023,9 @@ impl Tool for MouseDragTool {
     fn def(&self) -> &ToolDef {
         MDRAG_DEF.get_or_init(|| ToolDef {
             name: "mouse_drag".into(),
-            description: "Move a previously-held mouse button to a new point via background X11 delivery. \
-                Requires an active mouse_button_down state; does not release the button. \
-                Returns the updated held-button state.".into(),
+            description: "Move a previously-held mouse button to a new point using the delivery \
+                session established by mouse_button_down. Requires an active held state; does not \
+                release the button. Returns the updated held-button state.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
                 "session":{"type":"string","description":"Optional multi-cursor session id; takes precedence over cursor_id."},
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -3978,8 +4228,9 @@ impl Tool for MouseButtonUpTool {
     fn def(&self) -> &ToolDef {
         MUP_DEF.get_or_init(|| ToolDef {
             name: "mouse_button_up".into(),
-            description: "Release a previously-held mouse button via background X11 delivery. \
-                If x/y are omitted, releases at the last held position. Returns the current held-button state.".into(),
+            description: "Release a previously-held mouse button through the delivery session \
+                established by mouse_button_down. If x/y are omitted, releases at the last held \
+                position. Returns the current held-button state.".into(),
             input_schema: json!({"type":"object","properties":{
                 "session":{"type":"string","description":"Optional multi-cursor session id; takes precedence over cursor_id."},
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
@@ -4436,8 +4687,8 @@ impl Tool for GetScreenSizeTool {
     fn def(&self) -> &ToolDef {
         GSS_DEF.get_or_init(|| ToolDef {
             name: "get_screen_size".into(),
-            description: "Return the logical size of the main display in points plus its backing \
-                scale factor. Agents click in points; Retina displays have scale_factor 2.0. \
+            description: "Return the focused output's logical size, global origin, name, and \
+                backing scale factor on Hyprland; return the main screen geometry on X11. \
                 Requires no TCC permissions."
                 .into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
@@ -4449,19 +4700,40 @@ impl Tool for GetScreenSizeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let result = tokio::task::spawn_blocking(|| {
+            if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                return crate::wayland::hyprland::screen_size();
+            }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption).  Wayland/HiDPI X11 callers should query
             // `xrandr --query` for true scale.
             let (w, h) = x11_screen_size()?;
-            Ok::<(u32, u32, f64), anyhow::Error>((w, h, 1.0))
+            Ok::<(u32, u32, f64, i32, i32, String), anyhow::Error>((w, h, 1.0, 0, 0, String::new()))
         })
         .await;
         match result {
             // Matches Swift text format 1:1.
-            Ok(Ok((w, h, scale))) => {
-                ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
-                    .with_structured(json!({ "width": w, "height": h, "scale_factor": scale }))
+            Ok(Ok((w, h, scale, origin_x, origin_y, output_name))) => {
+                let coordinate_space =
+                    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                        "focused_output_logical"
+                    } else {
+                        "screen_physical"
+                    };
+                let mut structured = json!({
+                    "width": w,
+                    "height": h,
+                    "scale_factor": scale,
+                    "coordinate_space": coordinate_space,
+                    "origin": { "x": origin_x, "y": origin_y },
+                });
+                if !output_name.is_empty() {
+                    structured["output_name"] = json!(output_name);
+                }
+                ToolResult::text(format!(
+                    "✅ Display: {w}x{h} points @ {scale}x (origin {origin_x},{origin_y})"
+                ))
+                .with_structured(structured)
             }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -4550,6 +4822,21 @@ impl Tool for GetDesktopStateTool {
             // so screen-absolute pixels land exactly.
             let png = crate::capture::screenshot_display_bytes()?;
             let (shot_w, shot_h) = crate::capture::png_dimensions_pub(&png)?;
+            let hypr_space = if crate::wayland::is_wayland()
+                && crate::wayland::hyprland::is_session()
+            {
+                let space = crate::wayland::hyprland::desktop_capture_space()?;
+                if space.width.abs_diff(shot_w) > 1 || space.height.abs_diff(shot_h) > 1 {
+                    anyhow::bail!(
+                        "Hyprland desktop capture geometry mismatch: grim returned {shot_w}x{shot_h}, expected {}x{} from enabled-output layout",
+                        space.width,
+                        space.height
+                    );
+                }
+                Some(space)
+            } else {
+                None
+            };
             // True screen size. On a pure-Wayland session (native backend
             // opted in, no X11 DISPLAY) the capture above came from the
             // wlroots `zwlr_screencopy` cascade, whose full-display buffer is
@@ -4577,12 +4864,20 @@ impl Tool for GetDesktopStateTool {
             } else {
                 Some(B64.encode(&png))
             };
-            Ok((b64, shot_w, shot_h, screen_w, screen_h, written))
+            Ok((
+                b64,
+                shot_w,
+                shot_h,
+                screen_w,
+                screen_h,
+                written,
+                hypr_space,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written))) => {
+            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written, hypr_space))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({
                     "platform": "linux",
@@ -4592,6 +4887,14 @@ impl Tool for GetDesktopStateTool {
                     "screen_height": screen_h,
                     "screenshot_mime_type": "image/png",
                 });
+                if let Some(space) = hypr_space {
+                    structured["coordinate_space"] = json!("desktop_capture_physical");
+                    structured["logical_origin"] =
+                        json!({ "x": space.origin_x, "y": space.origin_y });
+                    structured["capture_scale_factor"] = json!(space.scale);
+                } else {
+                    structured["coordinate_space"] = json!("screen_physical");
+                }
                 if let Some(b64) = b64_opt {
                     content.push(cua_driver_core::protocol::Content::image_png(b64));
                 }
@@ -4641,12 +4944,30 @@ impl Tool for GetCursorPositionTool {
         // Native Wayland: there's no protocol for clients to query the real
         // global cursor position. Fall back to the synthetic registry that
         // records every `motion_absolute` this process emits.
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            let result =
+                tokio::task::spawn_blocking(crate::wayland::hyprland::cursor_position).await;
+            return match result {
+                Ok(Ok((x, y))) => ToolResult::text(format!(
+                    "✅ Cursor at ({x}, {y}) (Hyprland compositor state)"
+                ))
+                .with_structured(json!({
+                    "x": x,
+                    "y": y,
+                    "source": "hyprland",
+                    "coordinate_space": "global_logical",
+                })),
+                Ok(Err(error)) => ToolResult::error(error.to_string()),
+                Err(error) => ToolResult::error(format!("Task error: {error}")),
+            };
+        }
         if crate::wayland::is_wayland() {
             return match crate::wayland::last_synth_cursor_pos() {
                 Some((x, y)) => ToolResult::text(
                     format!("✅ Cursor at ({x}, {y}) (synthetic — last move_cursor in this process)")
                 ).with_structured(json!({
-                    "x": x, "y": y, "source": "synthetic"
+                    "x": x, "y": y, "source": "synthetic",
+                    "coordinate_space": "output_local_physical",
                 })),
                 None => ToolResult::text(
                     "Cursor position unknown on Wayland — no move_cursor has been issued in this process yet.".to_string()
@@ -4665,8 +4986,14 @@ impl Tool for GetCursorPositionTool {
         .await;
         match result {
             // Text format matches Swift `GetCursorPositionTool` 1:1.
-            Ok(Ok((x, y))) => ToolResult::text(format!("✅ Cursor at ({x}, {y})"))
-                .with_structured(json!({ "x": x, "y": y, "source": "x11" })),
+            Ok(Ok((x, y))) => {
+                ToolResult::text(format!("✅ Cursor at ({x}, {y})")).with_structured(json!({
+                    "x": x,
+                    "y": y,
+                    "source": "x11",
+                    "coordinate_space": "screen_physical",
+                }))
+            }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -4686,7 +5013,7 @@ impl Tool for MoveCursorTool {
     fn def(&self) -> &ToolDef {
         MCURSOR_DEF.get_or_init(|| ToolDef {
             name: "move_cursor".into(),
-            description: "Move the agent cursor overlay to (x, y). Does NOT move the real mouse cursor.".into(),
+            description: "Move the agent cursor overlay to (x, y). On native Wayland, also move the real cursor through the virtual-pointer backend.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
                 "x":{"type":"number"},"y":{"type":"number"},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"}
             },"additionalProperties":false}),
@@ -4697,7 +5024,8 @@ impl Tool for MoveCursorTool {
         use cua_driver_core::tool_args::ArgsExt;
         let x = args.f64_or("x", 0.0);
         let y = args.f64_or("y", 0.0);
-        let window_id = args.get("window_id").and_then(|v| v.as_u64());
+        let is_wayland = crate::wayland::is_wayland();
+        let is_hyprland = is_wayland && crate::wayland::hyprland::is_session();
         let cursor_id = resolve_cursor_key(&args);
         self.state.cursor_registry.update_position(&cursor_id, x, y);
         // End pointing upper-left (45°) — matches Swift's
@@ -4715,11 +5043,15 @@ impl Tool for MoveCursorTool {
         // Off-thread because the wayland-client roundtrip is blocking. Best-effort
         // — overlay update + registry write already succeeded; surface a warning
         // only if the warp itself failed.
-        let real_warp_note = if crate::wayland::is_wayland() {
+        let real_warp_note = if is_wayland {
             let xi = x.round() as i32;
             let yi = y.round() as i32;
             match tokio::task::spawn_blocking(move || {
-                crate::wayland::move_cursor_absolute(window_id, xi, yi)
+                if is_hyprland {
+                    crate::wayland::move_cursor_screen(xi, yi)
+                } else {
+                    crate::wayland::move_cursor_absolute(None, xi, yi)
+                }
             })
             .await
             {
@@ -4729,9 +5061,21 @@ impl Tool for MoveCursorTool {
         } else {
             ""
         };
+        let coordinate_space = if is_hyprland {
+            "global_logical"
+        } else if is_wayland {
+            "output_local_physical"
+        } else {
+            "screen_physical"
+        };
         ToolResult::text(format!(
             "Agent cursor '{cursor_id}' moved to ({x:.1}, {y:.1}).{real_warp_note}"
         ))
+        .with_structured(json!({
+            "x": x,
+            "y": y,
+            "coordinate_space": coordinate_space,
+        }))
     }
 }
 
@@ -5079,6 +5423,21 @@ fn parse_hex_color(hex: &str) -> Option<[u8; 4]> {
 
 // ── check_permissions ─────────────────────────────────────────────────────────
 
+fn executable_in_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path).any(|dir| {
+                std::fs::metadata(dir.join(name))
+                    .map(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub struct CheckPermissionsTool;
 static PERMS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
@@ -5113,6 +5472,12 @@ impl Tool for CheckPermissionsTool {
             .unwrap_or(false);
 
         let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+        let hyprland = crate::wayland::hyprland::is_session();
+        let (grim_ok, wtype_ok) = tokio::task::spawn_blocking(|| {
+            (executable_in_path("grim"), executable_in_path("wtype"))
+        })
+        .await
+        .unwrap_or((false, false));
         let atspi_status = if atspi_ok {
             match &dbus_address {
                 Some(a) => format!("✅ org.a11y.Bus reachable (DBUS_SESSION_BUS_ADDRESS={a})"),
@@ -5129,7 +5494,7 @@ impl Tool for CheckPermissionsTool {
                 .to_string()
         };
         let status_text = format!(
-            "X11 display: {}\nWayland: {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
+            "X11 display: {}\nWayland: {}\nHyprland IPC: {}\nHyprland capture (grim): {}\nHyprland keyboard (wtype): {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
             if x11_ok { "✅ connected" } else { "❌ DISPLAY not set or X11 unavailable" },
             match &wayland_display {
                 Some(s) if crate::wayland::wayland_enabled() =>
@@ -5141,11 +5506,24 @@ impl Tool for CheckPermissionsTool {
                 ),
                 None => "❌ not a Wayland session".to_string(),
             },
+            if hyprland { "✅ detected" } else { "not detected" },
+            if grim_ok { "✅ available" } else { "❌ not found in PATH" },
+            if wtype_ok { "✅ available" } else { "❌ not found in PATH" },
             atspi_status,
             if x11_ok { "✅ available" } else { "❌ requires X11" }
         );
-        ToolResult::text(status_text)
-            .with_structured(json!({ "x11": x11_ok, "wayland": wayland_display.is_some(), "wayland_enabled": crate::wayland::wayland_enabled(), "atspi": atspi_ok, "dbus_session_bus_address": dbus_address, "xsend_event": x11_ok }))
+        ToolResult::text(status_text).with_structured(json!({
+            "x11": x11_ok,
+            "wayland": wayland_display.is_some(),
+            "wayland_enabled": crate::wayland::wayland_enabled(),
+            "native_wayland_selected": crate::wayland::is_wayland(),
+            "hyprland": hyprland,
+            "grim": grim_ok,
+            "wtype": wtype_ok,
+            "atspi": atspi_ok,
+            "dbus_session_bus_address": dbus_address,
+            "xsend_event": x11_ok
+        }))
     }
 }
 
@@ -5370,7 +5748,7 @@ impl Tool for GetAccessibilityTreeTool {
         GAX_DEF.get_or_init(|| ToolDef {
             name: "get_accessibility_tree".into(),
             description: "Return a lightweight snapshot of the desktop: running processes and \
-                on-screen visible X11 windows with their bounds and owner pid.\n\n\
+                on-screen visible windows with their bounds and owner pid.\n\n\
                 For the full AT-SPI subtree of a single window (with interactive element indices \
                 you can click by), use get_window_state instead — this is a fast discovery read."
                 .into(),
@@ -5385,7 +5763,7 @@ impl Tool for GetAccessibilityTreeTool {
         let (procs, windows) = tokio::task::spawn_blocking(|| {
             (
                 crate::proc_fs::list_processes(),
-                crate::x11::list_windows(None),
+                crate::wayland::list_windows_dispatch(None),
             )
         })
         .await
@@ -5558,7 +5936,8 @@ impl Tool for TypeTextCharsTool {
                     "text":{"type":"string"},
                     "delay_ms":{"type":"integer","description":"Milliseconds between chars (default 30)."},
                     "element_index": cua_driver_core::tool_schema::element_index_schema(),
-                    "type_chars_only":{"type":"boolean","description":"Skip element focus, type directly. Default false."}
+                    "type_chars_only":{"type":"boolean","description":"Skip element focus, type directly. Default false."},
+                    "delivery_mode": crate::input::delivery::delivery_mode_schema()
                 },"additionalProperties":false
             }),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -5577,14 +5956,16 @@ impl Tool for TypeTextCharsTool {
         let text = cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&text_raw)
             .into_owned();
         let delay_ms = args.u64_or("delay_ms", 30);
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let xid_opt = args.opt_u64("window_id");
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -5596,8 +5977,12 @@ impl Tool for TypeTextCharsTool {
             }
         };
         let text_len = text.chars().count();
+        if let Some(error) = hyprland_focus_required(delivery) {
+            return error;
+        }
         let result = tokio::task::spawn_blocking(move || {
             if crate::wayland::is_wayland() {
+                crate::wayland::focus_window_for_input(xid)?;
                 // Per-char `wtype` loop with the requested delay — mirrors the
                 // X11 XSendEvent per-char path. Sleeping here is fine because
                 // we're inside spawn_blocking.
@@ -5691,11 +6076,10 @@ impl Tool for BringToFrontTool {
                  proper timestamp handling to beat focus-stealing prevention) — call \
                  it before `delivery_mode:\"foreground\"` input to avoid a per-call \
                  flash, or to escalate when background injection didn't land. \
-                 Wayland: a standalone activate is NOT exposed — the compositor's \
-                 security model bundles activation into the virtual-pointer/click \
-                 path, so use `delivery_mode:\"foreground\"` on the input call \
-                 itself; this reports that constraint on Wayland rather than \
-                 faking it. Matches the macOS / Windows bring_to_front rung."
+                 Hyprland: dispatches a compositor focus request and verifies the \
+                 active window before returning. Other Wayland compositors do not \
+                 expose a standalone external activation API. Matches the macOS / \
+                 Windows bring_to_front rung."
                 .into(),
             input_schema: serde_json::json!({
                 "type":"object","required":["pid"],"properties":{
@@ -5709,10 +6093,11 @@ impl Tool for BringToFrontTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        // Wayland: no standalone external activate (compositor security model
-        // bundles it into the vptr/click path). Report honestly; the agent
-        // escalates via delivery_mode:"foreground" on the input call instead.
-        if crate::wayland::is_wayland() {
+        let hyprland = crate::wayland::is_wayland() && crate::wayland::hyprland::is_session();
+        // Generic Wayland has no standalone external activate. Hyprland is the
+        // explicit exception because its authenticated local IPC exposes and
+        // confirms a compositor focus dispatch.
+        if crate::wayland::is_wayland() && !hyprland {
             return ToolResult::error(
                 "bring_to_front: Wayland has no standalone window-activation API for \
                  external clients — the compositor bundles activation into the \
@@ -5731,15 +6116,16 @@ impl Tool for BringToFrontTool {
             }));
         }
 
-        // X11: resolve the target xid (window_id, else first window for pid).
+        // Resolve the target id (window_id, else first window for pid).
         let xid = match args.opt_u64("window_id") {
             Some(x) => x,
             None => {
                 let pid = args.u64_or("pid", 0) as u32;
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -5750,6 +6136,26 @@ impl Tool for BringToFrontTool {
                 }
             }
         };
+
+        if hyprland {
+            let result =
+                tokio::task::spawn_blocking(move || crate::wayland::hyprland::focus_window(xid))
+                    .await;
+            return match result {
+                Ok(Ok(())) => ToolResult::text(format!(
+                    "✅ Brought window {xid} to front (Hyprland compositor focus)."
+                ))
+                .with_structured(serde_json::json!({
+                    "window_id": xid,
+                    "platform": "linux",
+                    "session": "hyprland",
+                    "verified": true,
+                })),
+                Ok(Err(error)) => ToolResult::error(format!("bring_to_front failed: {error}")),
+                Err(error) => ToolResult::error(format!("Task error: {error}")),
+            };
+        }
+
         let r =
             tokio::task::spawn_blocking(move || crate::input::x11_activate_window_persistent(xid))
                 .await;
@@ -5919,6 +6325,80 @@ mod click_button_schema_tests {
             lc.contains("wayland"),
             "description should call out wayland fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod hyprland_delivery_schema_tests {
+    use super::{DoubleClickTool, RightClickTool, ScrollTool, ToolState};
+    use cua_driver_core::tool::{Tool, ToolDef};
+
+    fn assert_hyprland_foreground_contract(def: &ToolDef) {
+        let schema = &def.input_schema;
+        assert_eq!(
+            schema.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false),
+            "{} must reject undeclared input properties",
+            def.name
+        );
+
+        let delivery = schema
+            .get("properties")
+            .and_then(|v| v.get("delivery_mode"))
+            .unwrap_or_else(|| panic!("{} schema must expose delivery_mode", def.name));
+        assert_eq!(
+            delivery.get("type").and_then(|v| v.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            delivery.get("default").and_then(|v| v.as_str()),
+            Some("background")
+        );
+        let modes = delivery
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("delivery_mode enum");
+        for mode in ["background", "foreground"] {
+            assert!(
+                modes.iter().any(|value| value.as_str() == Some(mode)),
+                "{} delivery_mode enum must include {mode}",
+                def.name
+            );
+        }
+
+        let field_description = delivery
+            .get("description")
+            .and_then(|v| v.as_str())
+            .expect("delivery_mode description")
+            .to_ascii_lowercase();
+        assert!(field_description.contains("hyprland"));
+        assert!(field_description.contains("foreground"));
+
+        let tool_description = def.description.to_ascii_lowercase();
+        assert!(
+            tool_description.contains("hyprland"),
+            "{} description must identify the Hyprland constraint",
+            def.name
+        );
+        assert!(
+            tool_description.contains("delivery_mode=foreground"),
+            "{} description must name the required Hyprland delivery mode",
+            def.name
+        );
+    }
+
+    #[test]
+    fn focus_enforcing_tools_advertise_delivery_mode_in_closed_schemas() {
+        let state = ToolState::new();
+        let double_click = DoubleClickTool {
+            state: state.clone(),
+        };
+        let right_click = RightClickTool { state };
+        let scroll = ScrollTool;
+
+        for def in [double_click.def(), right_click.def(), scroll.def()] {
+            assert_hyprland_foreground_contract(def);
+        }
     }
 }
 

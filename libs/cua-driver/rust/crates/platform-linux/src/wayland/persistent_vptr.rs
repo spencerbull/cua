@@ -35,7 +35,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use wayland_client::{protocol::wl_pointer::ButtonState, Connection};
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
-use super::{evdev_pointer_button, open_vptr_session};
+use super::{evdev_pointer_button, open_vptr_session_at, protocol_window_id};
 
 /// One in-flight command from the public API to the owner thread.
 enum Cmd {
@@ -58,8 +58,7 @@ enum Cmd {
         button: u8,
         reply: Sender<anyhow::Result<()>>,
     },
-    /// Drop the entry for a cursor_id without sending wire events — used to
-    /// recover when the compositor disconnected mid-life.
+    /// Release any held buttons and drop the entry for a cursor_id.
     Forget {
         cursor_id: String,
         reply: Sender<anyhow::Result<()>>,
@@ -75,6 +74,12 @@ struct ActivePointer {
     /// Output extent at session open time — needed for motion_absolute.
     out_w: u32,
     out_h: u32,
+    output_name: Option<String>,
+    capture_origin_x: f64,
+    capture_origin_y: f64,
+    output_origin_x: f64,
+    output_origin_y: f64,
+    capture_to_output_scale: f64,
 }
 
 /// Process-global command channel into the owner thread. Lazily started on
@@ -125,10 +130,8 @@ fn owner_thread(rx: Receiver<Cmd>) {
                 let _ = reply.send(r);
             }
             Cmd::Forget { cursor_id, reply } => {
-                if let Some(p) = active.remove(&cursor_id) {
-                    p.vptr.destroy();
-                }
-                let _ = reply.send(Ok(()));
+                let r = release_all_and_forget(&mut active, &cursor_id);
+                let _ = reply.send(r);
             }
         }
     }
@@ -147,10 +150,17 @@ fn handle_press(
     // Keep the (out_w, out_h) but drop the queue + state at end of scope; the
     // vptr itself remains alive (Wayland objects survive their original queue
     // as long as the Connection is alive).
-    let mut sess = open_vptr_session(Some(window_id as u32))?;
+    let mut sess = open_vptr_session_at(
+        Some(protocol_window_id(window_id)?),
+        Some((f64::from(x), f64::from(y))),
+    )?;
     let (w, h) = (sess.output_w, sess.output_h);
-    let px = x.clamp(0, w as i32 - 1) as u32;
-    let py = y.clamp(0, h as i32 - 1) as u32;
+    let px = sess
+        .target_x
+        .unwrap_or_else(|| x.clamp(0, w as i32 - 1) as u32);
+    let py = sess
+        .target_y
+        .unwrap_or_else(|| y.clamp(0, h as i32 - 1) as u32);
     let btn = evdev_pointer_button(button);
 
     sess.vptr.motion_absolute(0, px, py, w, h);
@@ -178,6 +188,12 @@ fn handle_press(
             held,
             out_w: w,
             out_h: h,
+            output_name: sess.target_output_name,
+            capture_origin_x: sess.target_capture_x.unwrap_or(f64::from(x)),
+            capture_origin_y: sess.target_capture_y.unwrap_or(f64::from(y)),
+            output_origin_x: f64::from(px),
+            output_origin_y: f64::from(py),
+            capture_to_output_scale: sess.target_capture_to_output_scale.unwrap_or(1.0),
         },
     );
     Ok(())
@@ -189,19 +205,124 @@ fn handle_move(
     x: i32,
     y: i32,
 ) -> anyhow::Result<()> {
-    let entry = active.get_mut(cursor_id).ok_or_else(|| {
+    let entry = active.get(cursor_id).ok_or_else(|| {
         anyhow::anyhow!(
             "no held mouse button for cursor '{cursor_id}'; call mouse_button_down first"
         )
     })?;
-    let px = x.clamp(0, entry.out_w as i32 - 1) as u32;
-    let py = y.clamp(0, entry.out_h as i32 - 1) as u32;
+    let mapped_point = if let Some(output_name) = &entry.output_name {
+        match cached_output_point(
+            entry.capture_origin_x,
+            entry.capture_origin_y,
+            entry.output_origin_x,
+            entry.output_origin_y,
+            entry.capture_to_output_scale,
+            entry.out_w,
+            entry.out_h,
+            x,
+            y,
+        ) {
+            Some(point) => Ok(point),
+            None => Err(output_name.clone()),
+        }
+    } else {
+        Ok((
+            x.clamp(0, entry.out_w as i32 - 1) as u32,
+            y.clamp(0, entry.out_h as i32 - 1) as u32,
+        ))
+    };
+
+    let (px, py) = match mapped_point {
+        Ok(point) => point,
+        Err(output_name) => {
+            let cleanup = release_all_and_forget(active, cursor_id);
+            let message = format!(
+                "Hyprland held-pointer move leaves bound output {output_name}; the held gesture was canceled and its buttons released"
+            );
+            return match cleanup {
+                Ok(()) => Err(anyhow::anyhow!(message)),
+                Err(error) => Err(anyhow::anyhow!(
+                    "{message}, but compositor cleanup failed: {error}"
+                )),
+            };
+        }
+    };
+    let entry = active
+        .get(cursor_id)
+        .expect("active pointer remains present after a mapped move");
     entry
         .vptr
         .motion_absolute(0, px, py, entry.out_w, entry.out_h);
     entry.vptr.frame();
     roundtrip_on_persistent(cursor_id)?;
     Ok(())
+}
+
+fn held_buttons_for_release(held: &HashSet<u32>) -> Vec<u32> {
+    let mut buttons: Vec<u32> = held.iter().copied().collect();
+    buttons.sort_unstable();
+    buttons
+}
+
+/// End a persistent pointer without abandoning compositor-side button state.
+/// Release requests are committed before the proxy and connection are removed;
+/// even when that roundtrip fails, destroying the device and closing its
+/// connection remains the safest recovery path.
+fn release_all_and_forget(
+    active: &mut HashMap<String, ActivePointer>,
+    cursor_id: &str,
+) -> anyhow::Result<()> {
+    let release_result = if let Some(entry) = active.get(cursor_id) {
+        for button in held_buttons_for_release(&entry.held) {
+            entry.vptr.button(0, button, ButtonState::Released);
+        }
+        entry.vptr.frame();
+        roundtrip_on_persistent(cursor_id)
+    } else {
+        Ok(())
+    };
+
+    let destroy_result = if let Some(entry) = active.remove(cursor_id) {
+        entry.vptr.destroy();
+        roundtrip_on_persistent(cursor_id)
+    } else {
+        Ok(())
+    };
+    forget_conn(cursor_id);
+
+    release_result.and(destroy_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_output_point(
+    capture_origin_x: f64,
+    capture_origin_y: f64,
+    output_origin_x: f64,
+    output_origin_y: f64,
+    capture_to_output_scale: f64,
+    output_width: u32,
+    output_height: u32,
+    x: i32,
+    y: i32,
+) -> Option<(u32, u32)> {
+    let raw_x = output_origin_x + (f64::from(x) - capture_origin_x) * capture_to_output_scale;
+    let raw_y = output_origin_y + (f64::from(y) - capture_origin_y) * capture_to_output_scale;
+    if raw_x < 0.0
+        || raw_y < 0.0
+        || raw_x >= f64::from(output_width)
+        || raw_y >= f64::from(output_height)
+    {
+        None
+    } else {
+        Some((
+            raw_x
+                .round()
+                .clamp(0.0, output_width.saturating_sub(1) as f64) as u32,
+            raw_y
+                .round()
+                .clamp(0.0, output_height.saturating_sub(1) as f64) as u32,
+        ))
+    }
 }
 
 fn handle_release(
@@ -320,10 +441,9 @@ pub fn release(cursor_id: &str, button: u8) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
 }
 
-/// Drop the entry for `cursor_id` without emitting any Wayland events.
-/// Useful for recovery — if the agent thinks a button is held but the
-/// compositor disagrees, this clears the local state without trying to
-/// send a release that would error.
+/// Release every button held by `cursor_id`, commit those events, then destroy
+/// the virtual pointer and tear down its Wayland connection. This is safe to
+/// call when no entry exists and is also the recovery path for aborted drags.
 pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
     let (tx_r, rx_r) = bounded(1);
     tx().send(Cmd::Forget {
@@ -333,4 +453,29 @@ pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
     rx_r.recv()
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{cached_output_point, held_buttons_for_release};
+
+    #[test]
+    fn cached_drag_mapping_scales_without_requerying_compositor() {
+        assert_eq!(
+            cached_output_point(100.0, 50.0, 400.0, 200.0, 1.25, 1920, 1080, 180, 90),
+            Some((500, 250))
+        );
+        assert_eq!(
+            cached_output_point(100.0, 50.0, 10.0, 10.0, 1.0, 1920, 1080, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_releases_every_held_button_in_stable_order() {
+        let held = HashSet::from([0x112, 0x110, 0x111]);
+        assert_eq!(held_buttons_for_release(&held), vec![0x110, 0x111, 0x112]);
+    }
 }

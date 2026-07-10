@@ -1613,6 +1613,21 @@ fn parse_gtk_frame_extents(vals: &[u32]) -> Option<(i32, i32)> {
 /// query screen origins, by design) or when no X11 window resolves.
 fn window_to_screen_offset(pid: u32, xid: u64) -> Option<(i32, i32)> {
     if crate::wayland::is_wayland() {
+        // Hyprland exposes exact window geometry through its local IPC. Prefer
+        // that over the GNOME Shell helper so native GTK window-relative
+        // extents become real global coordinates on Hyprland as well.
+        if crate::wayland::hyprland::is_session() {
+            return if crate::wayland::hyprland::is_surrogate_window_id(xid) {
+                crate::wayland::hyprland::window_origin(xid).ok()
+            } else {
+                // A non-zero non-surrogate id can be a real XWayland XID.
+                // Resolve it by pid through Hyprland instead of feeding it to
+                // the CUA surrogate registry.
+                crate::wayland::hyprland::window_origin_for_pid(pid)
+                    .ok()
+                    .flatten()
+            };
+        }
         // Native Wayland: clients can't query a window's screen origin, and
         // AT-SPI CoordType::Screen collapses to (0,0) on Mutter. The bundled
         // `org.cua.WinRects` GNOME Shell extension supplies the window's screen

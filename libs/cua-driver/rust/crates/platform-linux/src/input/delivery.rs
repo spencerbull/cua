@@ -22,8 +22,11 @@
 //!   active window.
 //!   - **X11**: EWMH `_NET_ACTIVE_WINDOW` client message (the `wmctrl -a`
 //!     equivalent) raise + activate.
-//!   - **Wayland**: compositor-specific activate where supported; else the
-//!     libei-to-focus path with an honest note.
+//!   - **Hyprland**: compositor-specific focus dispatch before injection. The
+//!     target remains focused because Hyprland does not expose an atomic
+//!     activate-inject-restore transaction to external clients.
+//!   - **Other Wayland**: compositor-specific activate where supported; else
+//!     the libei-to-focus path with an honest note.
 //!   The agent's explicit last resort; a brief focus swap unless the target was
 //!   already active. Matches the macOS / Windows `foreground` rung.
 
@@ -37,7 +40,8 @@ pub enum DeliveryMode {
     /// Inject without activating the target (X11 XTEST/MPX; Wayland libei-to-focus).
     #[default]
     Background,
-    /// Activate the target, inject, restore prior active window.
+    /// Activate the target and inject. Restores prior focus where supported;
+    /// Hyprland intentionally leaves the verified target focused.
     Foreground,
 }
 
@@ -81,9 +85,11 @@ pub fn delivery_mode_schema() -> Value {
          is available the tool returns a structured background_unavailable \
          error. 'foreground' is the explicit escalation: activate the target \
          (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then \
-         restore the prior active window — a brief focus swap unless the \
-         target was already active. Call bring_to_front first to avoid the \
-         flash. Matches the macOS / Windows delivery_mode surface.",
+         restore the prior active window where supported. Hyprland is an \
+         explicit exception: foreground input verifies a compositor focus \
+         dispatch and leaves the target focused. Call bring_to_front first \
+         when persistent focus is desired. Matches the macOS / Windows \
+         delivery_mode surface.",
     );
     v["default"] = serde_json::json!("background");
     v
@@ -98,6 +104,9 @@ pub enum BackgroundUnavailable {
     /// X11/Chromium does not accept a key chord addressed to an unfocused
     /// renderer without briefly moving focus, which background delivery forbids.
     ChromiumHotkey,
+    /// Hyprland routes virtual pointer/keyboard events to compositor focus;
+    /// targeting a specific window therefore requires explicit activation.
+    HyprlandNeedsFocus,
 }
 
 impl BackgroundUnavailable {
@@ -105,6 +114,7 @@ impl BackgroundUnavailable {
         match self {
             Self::NoLibeiBackend => "background_unavailable",
             Self::ChromiumHotkey => "background_unavailable",
+            Self::HyprlandNeedsFocus => "background_unavailable",
         }
     }
     fn detail(self) -> &'static str {
@@ -117,6 +127,11 @@ impl BackgroundUnavailable {
             Self::ChromiumHotkey => {
                 "Chromium/Electron does not accept a key chord addressed to an \
                  unfocused renderer through X11 background injection"
+            }
+            Self::HyprlandNeedsFocus => {
+                "Hyprland virtual-pointer and virtual-keyboard protocols route to \
+                 compositor focus, so a specific non-focused window cannot be \
+                 targeted without activating it"
             }
         }
     }

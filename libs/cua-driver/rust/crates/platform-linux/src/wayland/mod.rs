@@ -1,7 +1,7 @@
 //! Native-Wayland backend.
 //!
-//! Used when running under a Wayland compositor with no X11 (WAYLAND_DISPLAY
-//! set, DISPLAY unset). Enumerates toplevels via
+//! Used when running under a Wayland compositor without X11, plus explicitly
+//! enabled Hyprland sessions where XWayland also exports `DISPLAY`. Enumerates toplevels via
 //! `zwlr_foreign_toplevel_manager_v1`, captures per-output screenshots via
 //! `zwlr_screencopy_manager_v1` + `wl_shm` (native — `grim` remains a
 //! fallback), and synthesises pointer / scroll / drag input via
@@ -11,6 +11,7 @@
 //! typed error on pure Wayland.
 
 pub mod ext_screencopy;
+pub(crate) mod hyprland;
 pub mod overlay;
 pub mod persistent_vptr;
 pub mod portal_screenshot;
@@ -97,14 +98,27 @@ pub fn wayland_enabled() -> bool {
 }
 
 /// True when we should drive Wayland rather than X11: the experimental backend
-/// is opted in ([`wayland_enabled`]), a Wayland display is present, and there is
-/// no X11 DISPLAY to fall back to. Without the opt-in this returns false even on
-/// a pure-Wayland session, so the backend treats it as unsupported rather than
-/// silently engaging an incomplete code path.
+/// is opted in ([`wayland_enabled`]), a Wayland display is present, and either
+/// there is no X11 DISPLAY to fall back to or Hyprland IPC can supply the pid,
+/// geometry, focus and output metadata omitted by generic Wayland protocols.
+/// The explicit opt-in remains required; Seform's wrapper enables it after
+/// confirming that `hyprctl` is reachable.
+fn should_use_wayland(
+    enabled: bool,
+    has_wayland_display: bool,
+    has_x11_display: bool,
+    is_hyprland: bool,
+) -> bool {
+    enabled && has_wayland_display && (!has_x11_display || is_hyprland)
+}
+
 pub fn is_wayland() -> bool {
-    wayland_enabled()
-        && std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("DISPLAY").is_none()
+    should_use_wayland(
+        wayland_enabled(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+        hyprland::is_session(),
+    )
 }
 
 /// Reason string when X11 input injection cannot possibly work, so callers
@@ -232,7 +246,9 @@ struct State {
     // Virtual-pointer manager + output dimensions, so `click` can land a real
     // button press at the output centre (over the just-activated window).
     vptr_manager: Option<ZwlrVirtualPointerManagerV1>,
+    vptr_manager_version: u32,
     output: Option<WlOutput>,
+    outputs_by_name: HashMap<String, WlOutput>,
     output_w: u32,
     output_h: u32,
     // Native screencopy capture state.
@@ -264,9 +280,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 let v = version.min(7);
                 state.seat = Some(registry.bind::<WlSeat, _, _>(name, v, qh, ()));
             } else if interface == ZwlrVirtualPointerManagerV1::interface().name {
+                state.vptr_manager_version = version.min(2);
                 state.vptr_manager = Some(registry.bind::<ZwlrVirtualPointerManagerV1, _, _>(
                     name,
-                    version.min(2),
+                    state.vptr_manager_version,
                     qh,
                     (),
                 ));
@@ -306,16 +323,24 @@ impl Dispatch<WlSeat, ()> for State {
 impl Dispatch<WlOutput, ()> for State {
     fn event(
         state: &mut Self,
-        _: &WlOutput,
+        output: &WlOutput,
         event: wl_output::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Remember the output resolution so `click` can aim at its centre.
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            state.output_w = width.max(0) as u32;
-            state.output_h = height.max(0) as u32;
+        // Remember the output resolution so `click` can aim at its centre, and
+        // retain each named output so Hyprland can bind a virtual pointer to the
+        // monitor containing the target window.
+        match event {
+            wl_output::Event::Mode { width, height, .. } => {
+                state.output_w = width.max(0) as u32;
+                state.output_h = height.max(0) as u32;
+            }
+            wl_output::Event::Name { name } => {
+                state.outputs_by_name.insert(name, output.clone());
+            }
+            _ => {}
         }
     }
 }
@@ -755,7 +780,9 @@ pub(crate) unsafe fn borrowed_fd(fd: i32) -> std::os::fd::OwnedFd {
 /// applicable, else X11. Mirrors `screenshot_window_dispatch` for the
 /// output-level path used by `get_window_state`'s vision payload.
 pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
-    if is_wayland() {
+    if is_wayland() && hyprland::is_session() {
+        hyprland::capture_window(xid)
+    } else if is_wayland() {
         screenshot_bytes()
     } else {
         crate::capture::screenshot_window_bytes(xid)
@@ -770,6 +797,12 @@ pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
 ///    on first use per session.
 /// 3. X11: existing root-window path.
 pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
+    if is_wayland() && hyprland::is_session() {
+        // `zwlr_screencopy` captures one output. Hyprland's `grim` integration
+        // composes every enabled output into one desktop PNG, which is the
+        // coordinate surface exposed by get_desktop_state.
+        return hyprland::capture_desktop();
+    }
     if is_wayland() {
         // Tier 1: native wlroots screencopy (fast, zero consent).
         match screenshot_bytes() {
@@ -812,6 +845,9 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
 /// output-only, and `foreign-toplevel` exposes no per-window geometry to
 /// crop with.
 pub fn screenshot_window_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
+    if is_wayland() && hyprland::is_session() {
+        return hyprland::capture_window(xid);
+    }
     if is_wayland() {
         anyhow::bail!(
             "per-window screenshot is not yet supported on native Wayland — \
@@ -835,6 +871,24 @@ pub struct VptrSession {
     pub vptr: ZwlrVirtualPointerV1,
     pub output_w: u32,
     pub output_h: u32,
+    /// Explicit Hyprland target point in the bound output's physical pixels.
+    /// Generic Wayland sessions leave these unset.
+    pub target_x: Option<u32>,
+    pub target_y: Option<u32>,
+    pub target_screen_x: Option<f64>,
+    pub target_screen_y: Option<f64>,
+    pub target_output_name: Option<String>,
+    pub target_capture_x: Option<f64>,
+    pub target_capture_y: Option<f64>,
+    pub target_capture_to_output_scale: Option<f64>,
+}
+
+fn protocol_window_id(window_id: u64) -> anyhow::Result<u32> {
+    u32::try_from(window_id).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid window_id {window_id}: Wayland/Hyprland window ids must fit in 32 bits; refresh with list_windows"
+        )
+    })
 }
 
 /// Bind manager + seat + virtual-pointer + first output, optionally activate a
@@ -844,6 +898,35 @@ pub struct VptrSession {
 /// pointer event in *output* coordinates and rely on the activated toplevel
 /// covering the centre.
 pub fn open_vptr_session(activate_window_id: Option<u32>) -> anyhow::Result<VptrSession> {
+    open_vptr_session_at(activate_window_id, None)
+}
+
+/// Open a virtual-pointer session aimed at an explicit window-screenshot
+/// point. Hyprland needs the point up front so the pointer is bound to the
+/// output that actually contains the requested pixel.
+pub(crate) fn open_vptr_session_at(
+    activate_window_id: Option<u32>,
+    window_point: Option<(f64, f64)>,
+) -> anyhow::Result<VptrSession> {
+    let hypr_target = if hyprland::is_session() {
+        if let Some(id) = activate_window_id {
+            Some(match window_point {
+                Some(point) => hyprland::pointer_target(u64::from(id), point.0, point.1)?,
+                None => hyprland::default_pointer_target(u64::from(id))?,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    open_vptr_session_with_target(activate_window_id, hypr_target)
+}
+
+fn open_vptr_session_with_target(
+    activate_window_id: Option<u32>,
+    hypr_target: Option<hyprland::PointerTarget>,
+) -> anyhow::Result<VptrSession> {
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
@@ -878,18 +961,80 @@ pub fn open_vptr_session(activate_window_id: Option<u32>) -> anyhow::Result<Vptr
         }
     })?;
 
-    if let Some(id) = activate_window_id {
-        let handle = state
-            .handles
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no native Wayland toplevel for window_id {id}"))?;
-        handle.activate(&seat);
-        queue.roundtrip(&mut state)?;
+    if hypr_target.is_none() {
+        if let Some(id) = activate_window_id {
+            let handle =
+                state.handles.get(&id).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("no native Wayland toplevel for window_id {id}")
+                })?;
+            handle.activate(&seat);
+            queue.roundtrip(&mut state)?;
+        }
     }
 
-    let vptr = mgr.create_virtual_pointer(Some(&seat), &qh, ());
-    let (output_w, output_h) = (state.output_w.max(1), state.output_h.max(1));
+    let (
+        vptr,
+        output_w,
+        output_h,
+        target_x,
+        target_y,
+        target_screen_x,
+        target_screen_y,
+        target_output_name,
+        target_capture_x,
+        target_capture_y,
+        target_capture_to_output_scale,
+    ) = if let Some(target) = hypr_target {
+        if state.vptr_manager_version < 2 {
+            anyhow::bail!(
+                "Hyprland output-bound input requires zwlr_virtual_pointer_manager_v1 version 2; compositor advertised version {}",
+                state.vptr_manager_version
+            );
+        }
+        let output = state
+            .outputs_by_name
+            .get(&target.output_name)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Hyprland target is on output {:?}, but Wayland exposed no matching wl_output.name; output-bound input requires wl_output version 4 names",
+                    target.output_name
+                )
+            })?;
+        if let Some(id) = activate_window_id {
+            // Do not steal focus until all Wayland protocol/output validation
+            // has succeeded. A missing v2 manager or output name must be a
+            // side-effect-free error.
+            hyprland::focus_window(u64::from(id))?;
+        }
+        (
+            mgr.create_virtual_pointer_with_output(Some(&seat), Some(&output), &qh, ()),
+            target.output_width,
+            target.output_height,
+            Some(target.output_x),
+            Some(target.output_y),
+            Some(target.screen_x),
+            Some(target.screen_y),
+            Some(target.output_name),
+            Some(target.capture_x),
+            Some(target.capture_y),
+            Some(target.capture_to_output_scale),
+        )
+    } else {
+        (
+            mgr.create_virtual_pointer(Some(&seat), &qh, ()),
+            state.output_w.max(1),
+            state.output_h.max(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
     Ok(VptrSession {
         conn,
         queue,
@@ -898,6 +1043,14 @@ pub fn open_vptr_session(activate_window_id: Option<u32>) -> anyhow::Result<Vptr
         vptr,
         output_w,
         output_h,
+        target_x,
+        target_y,
+        target_screen_x,
+        target_screen_y,
+        target_output_name,
+        target_capture_x,
+        target_capture_y,
+        target_capture_to_output_scale,
     })
 }
 
@@ -911,23 +1064,43 @@ pub fn evdev_pointer_button(button: u8) -> u32 {
     }
 }
 
+fn resolve_click_point(
+    target: Option<(u32, u32)>,
+    point: Option<(i32, i32)>,
+    width: u32,
+    height: u32,
+) -> (u32, u32) {
+    if let Some(target) = target {
+        target
+    } else if let Some((x, y)) = point {
+        (
+            x.clamp(0, width as i32 - 1) as u32,
+            y.clamp(0, height as i32 - 1) as u32,
+        )
+    } else {
+        (width / 2, height / 2)
+    }
+}
+
 /// Click a native Wayland toplevel identified by its `window_id` (the
 /// foreign-toplevel protocol id from `list_windows`) at output-relative
 /// `(x, y)`, with `button` (1/2/3 = left/middle/right) emitted `count` times.
-/// Coordinates default to the output centre when both x and y are zero so
-/// the legacy focus-based behaviour is preserved when callers can't supply
-/// real coords. A short delay between iterations gives the compositor time
-/// to discriminate single vs. double clicks.
-pub fn click(window_id: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session(Some(window_id as u32))?;
+/// `point=None` targets the window centre; `Some((0, 0))` is the real top-left
+/// screenshot pixel. A short delay between iterations gives the compositor
+/// time to discriminate single vs. double clicks.
+pub fn click(
+    window_id: u64,
+    point: Option<(i32, i32)>,
+    count: u32,
+    button: u8,
+) -> anyhow::Result<()> {
+    let mut sess = open_vptr_session_at(
+        Some(protocol_window_id(window_id)?),
+        point.map(|(x, y)| (f64::from(x), f64::from(y))),
+    )?;
     let (w, h) = (sess.output_w, sess.output_h);
-    let (px, py) = if x == 0 && y == 0 {
-        ((w / 2) as i32, (h / 2) as i32)
-    } else {
-        (x, y)
-    };
-    let px = px.clamp(0, w as i32 - 1) as u32;
-    let py = py.clamp(0, h as i32 - 1) as u32;
+    let target = sess.target_x.zip(sess.target_y);
+    let (px, py) = resolve_click_point(target, point, w, h);
     let btn = evdev_pointer_button(button);
     for i in 0..count.max(1) {
         if i > 0 {
@@ -943,7 +1116,74 @@ pub fn click(window_id: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::
     }
     // Keep the synthetic-cursor registry in sync with the warp we just
     // performed so a subsequent `get_cursor_position` reflects reality.
-    record_synth_cursor(px as i32, py as i32);
+    record_synth_cursor(
+        sess.target_screen_x.unwrap_or(f64::from(px)).round() as i32,
+        sess.target_screen_y.unwrap_or(f64::from(py)).round() as i32,
+    );
+    sess.vptr.destroy();
+    sess.queue.roundtrip(&mut sess.state)?;
+    Ok(())
+}
+
+/// Click a pixel from the full-desktop PNG returned by get_desktop_state.
+/// Hyprland's composed PNG is physical-pixel scaled, while virtual-pointer
+/// input is output-local, so convert through the declared desktop capture
+/// space before choosing and binding the destination output.
+pub fn click_desktop_capture(
+    capture_x: i32,
+    capture_y: i32,
+    count: u32,
+    button: u8,
+) -> anyhow::Result<(f64, f64)> {
+    let (screen_x, screen_y) =
+        hyprland::desktop_capture_to_screen(f64::from(capture_x), f64::from(capture_y))?;
+    let target = hyprland::global_pointer_target(screen_x, screen_y)?;
+    // Do not activate a guessed toplevel before this click. The pixel came
+    // from the composed desktop, so raising a window could invalidate the
+    // captured scene; virtual-pointer motion establishes pointer focus at the
+    // surface currently under this exact screen point.
+    let mut sess = open_vptr_session_with_target(None, Some(target))?;
+    let (w, h) = (sess.output_w, sess.output_h);
+    let (px, py) = (
+        sess.target_x
+            .ok_or_else(|| anyhow::anyhow!("Hyprland desktop target has no output x"))?,
+        sess.target_y
+            .ok_or_else(|| anyhow::anyhow!("Hyprland desktop target has no output y"))?,
+    );
+    let btn = evdev_pointer_button(button);
+    for i in 0..count.max(1) {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+        sess.vptr.motion_absolute(0, px, py, w, h);
+        sess.vptr.frame();
+        sess.vptr.button(0, btn, ButtonState::Pressed);
+        sess.vptr.frame();
+        sess.vptr.button(0, btn, ButtonState::Released);
+        sess.vptr.frame();
+        sess.queue.roundtrip(&mut sess.state)?;
+    }
+    record_synth_cursor(screen_x.round() as i32, screen_y.round() as i32);
+    sess.vptr.destroy();
+    sess.queue.roundtrip(&mut sess.state)?;
+    Ok((screen_x, screen_y))
+}
+
+/// Move the real cursor to a Hyprland global logical screen point.
+pub fn move_cursor_screen(screen_x: i32, screen_y: i32) -> anyhow::Result<()> {
+    let target = hyprland::global_pointer_target(f64::from(screen_x), f64::from(screen_y))?;
+    let mut sess = open_vptr_session_with_target(None, Some(target))?;
+    let (w, h) = (sess.output_w, sess.output_h);
+    let (px, py) = (
+        sess.target_x
+            .ok_or_else(|| anyhow::anyhow!("Hyprland screen target has no output x"))?,
+        sess.target_y
+            .ok_or_else(|| anyhow::anyhow!("Hyprland screen target has no output y"))?,
+    );
+    sess.vptr.motion_absolute(0, px, py, w, h);
+    sess.vptr.frame();
+    sess.queue.roundtrip(&mut sess.state)?;
+    record_synth_cursor(screen_x, screen_y);
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -954,7 +1194,7 @@ pub fn click(window_id: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::
 /// virtual-pointer protocol, mirroring how a real wheel notch decomposes. The
 /// magnitude follows wl_pointer convention: ±10 (in wl_fixed = ×256) per tick.
 pub fn scroll(window_id: u64, direction: &str, amount: u32) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session(Some(window_id as u32))?;
+    let mut sess = open_vptr_session(Some(protocol_window_id(window_id)?))?;
     let (axis, sign): (Axis, i32) = match direction.to_ascii_lowercase().as_str() {
         "up" => (Axis::VerticalScroll, -1),
         "down" => (Axis::VerticalScroll, 1),
@@ -965,6 +1205,14 @@ pub fn scroll(window_id: u64, direction: &str, amount: u32) -> anyhow::Result<()
     // axis_discrete: `value` is logical units (the wayland-rs wrapper
     // converts to wl_fixed internally); `discrete` is the tick count.
     let value: f64 = (sign as f64) * 10.0;
+    if let (Some(px), Some(py)) = (sess.target_x, sess.target_y) {
+        // Wheel events route through pointer focus. Put the bound pointer over
+        // the target window before emitting any axis events.
+        sess.vptr
+            .motion_absolute(0, px, py, sess.output_w, sess.output_h);
+        sess.vptr.frame();
+        sess.queue.roundtrip(&mut sess.state)?;
+    }
     for i in 0..amount.max(1) {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1014,14 +1262,24 @@ pub fn last_synth_cursor_pos() -> Option<(i32, i32)> {
 /// the compositor commits the warp before returning. Records the position in
 /// the synthetic-cursor registry so `last_synth_cursor_pos` can report it.
 pub fn move_cursor_absolute(window_id: Option<u64>, x: i32, y: i32) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session(window_id.map(|w| w as u32))?;
+    let mut sess = open_vptr_session_at(
+        window_id.map(protocol_window_id).transpose()?,
+        window_id.map(|_| (f64::from(x), f64::from(y))),
+    )?;
     let (w, h) = (sess.output_w, sess.output_h);
-    let px = x.clamp(0, (w as i32).saturating_sub(1)) as u32;
-    let py = y.clamp(0, (h as i32).saturating_sub(1)) as u32;
+    let px = sess
+        .target_x
+        .unwrap_or_else(|| x.clamp(0, (w as i32).saturating_sub(1)) as u32);
+    let py = sess
+        .target_y
+        .unwrap_or_else(|| y.clamp(0, (h as i32).saturating_sub(1)) as u32);
     sess.vptr.motion_absolute(0, px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
-    record_synth_cursor(px as i32, py as i32);
+    record_synth_cursor(
+        sess.target_screen_x.unwrap_or(f64::from(px)).round() as i32,
+        sess.target_screen_y.unwrap_or(f64::from(py)).round() as i32,
+    );
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -1041,7 +1299,10 @@ pub fn drag(
     steps: u32,
     button: u8,
 ) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session(Some(window_id as u32))?;
+    let mut sess = open_vptr_session_at(
+        Some(protocol_window_id(window_id)?),
+        Some((f64::from(from_x), f64::from(from_y))),
+    )?;
     let (w, h) = (sess.output_w, sess.output_h);
     let btn = evdev_pointer_button(button);
     let clamp_xy = |x: i32, y: i32| -> (u32, u32) {
@@ -1050,7 +1311,26 @@ pub fn drag(
             y.clamp(0, h as i32 - 1) as u32,
         )
     };
-    let (fx, fy) = clamp_xy(from_x, from_y);
+    let (fx, fy, tx, ty, end_screen) = if let Some(output_name) = &sess.target_output_name {
+        let end = hyprland::pointer_target(window_id, f64::from(to_x), f64::from(to_y))?;
+        if &end.output_name != output_name {
+            anyhow::bail!(
+                "Hyprland drag crosses outputs ({output_name} -> {}); output-bound virtual pointers cannot continue a held gesture across outputs",
+                end.output_name
+            );
+        }
+        (
+            sess.target_x.expect("Hyprland session target x"),
+            sess.target_y.expect("Hyprland session target y"),
+            end.output_x,
+            end.output_y,
+            Some((end.screen_x, end.screen_y)),
+        )
+    } else {
+        let (fx, fy) = clamp_xy(from_x, from_y);
+        let (tx, ty) = clamp_xy(to_x, to_y);
+        (fx, fy, tx, ty, None)
+    };
     sess.vptr.motion_absolute(0, fx, fy, w, h);
     sess.vptr.frame();
     sess.vptr.button(0, btn, ButtonState::Pressed);
@@ -1059,25 +1339,34 @@ pub fn drag(
     let n = steps.max(1);
     for s in 1..=n {
         let t = s as f64 / n as f64;
-        let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
-        let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
-        let (cx, cy) = clamp_xy(ix, iy);
+        let cx = (f64::from(fx) + (f64::from(tx) - f64::from(fx)) * t).round() as u32;
+        let cy = (f64::from(fy) + (f64::from(ty) - f64::from(fy)) * t).round() as u32;
         sess.vptr.motion_absolute(0, cx, cy, w, h);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    let (tx, ty) = clamp_xy(to_x, to_y);
     sess.vptr.motion_absolute(0, tx, ty, w, h);
     sess.vptr.frame();
     sess.vptr.button(0, btn, ButtonState::Released);
     sess.vptr.frame();
-    // Sync the synthetic-cursor registry with the drag endpoint so a
-    // subsequent `get_cursor_position` reports where we left the pointer.
-    record_synth_cursor(tx as i32, ty as i32);
     sess.queue.roundtrip(&mut sess.state)?;
+    // Sync the synthetic-cursor registry with the drag endpoint so a
+    // subsequent `get_cursor_position` reports only a committed warp.
+    let (record_x, record_y) = end_screen.unwrap_or((f64::from(tx), f64::from(ty)));
+    record_synth_cursor(record_x.round() as i32, record_y.round() as i32);
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
+    Ok(())
+}
+
+/// Confirm that a Hyprland target owns compositor focus before sending
+/// focus-routed virtual-keyboard input. Generic Wayland callers retain their
+/// existing activate/click flow; this helper is intentionally a no-op there.
+pub fn focus_window_for_input(window_id: u64) -> anyhow::Result<()> {
+    if is_wayland() && hyprland::is_session() {
+        hyprland::focus_window(window_id)?;
+    }
     Ok(())
 }
 
@@ -1252,6 +1541,11 @@ fn inject_send(lines: &[String]) -> anyhow::Result<()> {
 /// Resolve a window_id (foreign-toplevel protocol id) to its xdg app_id by
 /// enumerating toplevels — the inject protocol addresses windows by app_id.
 pub fn app_id_for_window(window_id: u64) -> Option<String> {
+    if hyprland::is_session() {
+        return hyprland::app_class(window_id)
+            .ok()
+            .filter(|class| !class.is_empty());
+    }
     let conn = Connection::connect_to_env().ok()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
@@ -1263,7 +1557,7 @@ pub fn app_id_for_window(window_id: u64) -> Option<String> {
     }
     state
         .toplevels
-        .get(&(window_id as u32))
+        .get(&u32::try_from(window_id).ok()?)
         .map(|t| t.app_id.clone())
         .filter(|s| !s.is_empty())
 }
@@ -1420,6 +1714,19 @@ pub fn inject_parallel_drags(drags: &[InjectDrag]) -> anyhow::Result<()> {
 /// Window-enumeration dispatcher: native Wayland when applicable, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if is_wayland() {
+        if hyprland::is_session() {
+            match hyprland::list_windows(filter_pid) {
+                Ok(windows) => return windows,
+                Err(error) => {
+                    // Hyprland IDs come from a guarded surrogate registry;
+                    // generic foreign-toplevel/X11 IDs are not interchangeable.
+                    // Fail closed instead of returning a namespace that later
+                    // focus/capture/input calls could misinterpret.
+                    tracing::error!("Hyprland list_windows failed: {error}");
+                    return Vec::new();
+                }
+            }
+        }
         // wlroots compositors expose zwlr_foreign_toplevel_management — use it
         // (it has no pid, so filter_pid can't apply there).
         match list_windows() {
@@ -1542,3 +1849,33 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ExtProbeState {
 // compatibility with earlier slice constants.
 #[allow(dead_code)]
 const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
+
+#[cfg(test)]
+mod selection_tests {
+    use super::{protocol_window_id, resolve_click_point, should_use_wayland};
+
+    #[test]
+    fn mixed_hyprland_session_uses_wayland_only_when_opted_in() {
+        assert!(should_use_wayland(true, true, true, true));
+        assert!(!should_use_wayland(false, true, true, true));
+    }
+
+    #[test]
+    fn non_hyprland_xwayland_keeps_x11_fallback() {
+        assert!(!should_use_wayland(true, true, true, false));
+        assert!(should_use_wayland(true, true, false, false));
+    }
+
+    #[test]
+    fn oversized_window_ids_do_not_alias_valid_protocol_ids() {
+        assert_eq!(protocol_window_id(u64::from(u32::MAX)).unwrap(), u32::MAX);
+        assert!(protocol_window_id(u64::from(u32::MAX) + 1).is_err());
+    }
+
+    #[test]
+    fn omitted_click_centers_but_explicit_zero_stays_top_left() {
+        assert_eq!(resolve_click_point(None, None, 100, 80), (50, 40));
+        assert_eq!(resolve_click_point(None, Some((0, 0)), 100, 80), (0, 0));
+        assert_eq!(resolve_click_point(Some((0, 0)), None, 100, 80), (0, 0));
+    }
+}
