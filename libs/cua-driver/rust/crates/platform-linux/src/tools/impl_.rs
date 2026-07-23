@@ -166,6 +166,7 @@ pub struct MouseHoldState {
     pub button: u8,
     pub x: f64,
     pub y: f64,
+    pub native_wayland: bool,
 }
 
 impl ToolState {
@@ -1411,6 +1412,11 @@ fn resolve_element_local_coords(
     };
 
     if crate::wayland::wayland_input_enabled() {
+        if crate::wayland::hyprland::is_session() {
+            let (local_x, local_y) =
+                crate::wayland::hyprland::screen_to_window_capture(xid, screen_cx, screen_cy)?;
+            return Ok((xid, local_x, local_y));
+        }
         let (window_x, window_y, window_width, window_height) =
             crate::wayland::window_geometry(xid)
                 .ok_or_else(|| anyhow::anyhow!("No Wayland geometry for window {xid}"))?;
@@ -1443,6 +1449,11 @@ fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        let (screen_x, screen_y) =
+            crate::wayland::hyprland::window_capture_to_screen(xid, x as i32, y as i32)?;
+        return Ok((f64::from(screen_x), f64::from(screen_y)));
+    }
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
     use x11rb::rust_connection::RustConnection;
@@ -1890,11 +1901,20 @@ fn resolve_cursor_key(args: &Value) -> String {
     for key in ["session", "cursor_id"] {
         if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
             if !v.is_empty() {
-                return v.to_owned();
+                return runtime_scoped_default_cursor(v);
             }
         }
     }
-    "default".to_owned()
+    runtime_scoped_default_cursor("default")
+}
+
+fn runtime_scoped_default_cursor(cursor_id: &str) -> String {
+    if cursor_id != "default" || cursor_id.starts_with("__cua_runtime_") {
+        return cursor_id.to_owned();
+    }
+    cua_driver_core::tool::current_dispatch_runtime_scope()
+        .map(|scope| format!("__cua_runtime_{scope}:default"))
+        .unwrap_or_else(|| "default".to_owned())
 }
 
 fn mouse_hold_json(cursor_id: &str, hold: Option<&MouseHoldState>) -> Value {
@@ -1918,6 +1938,78 @@ fn mouse_hold_json(cursor_id: &str, hold: Option<&MouseHoldState>) -> Value {
             "y": Value::Null,
         }),
     }
+}
+
+fn reconcile_ended_persistent_hold(
+    state: &ToolState,
+    cursor_id: &str,
+    error: &anyhow::Error,
+) -> Option<crate::wayland::persistent_vptr::PersistentPointerEndKind> {
+    let kind = crate::wayland::persistent_vptr::gesture_end_kind(error)?;
+    state.mouse_hold.lock().unwrap().remove(cursor_id);
+    crate::overlay::send_command_for(
+        cursor_id.to_owned(),
+        cursor_overlay::OverlayCommand::SetPressed(false),
+    );
+    Some(kind)
+}
+
+fn release_held_pointer_with<W, X>(
+    cursor_id: &str,
+    hold: Option<&MouseHoldState>,
+    release_wayland: W,
+    release_x11: X,
+) -> anyhow::Result<()>
+where
+    W: FnOnce(&str) -> anyhow::Result<()>,
+    X: FnOnce(u64, i32, i32, u8) -> anyhow::Result<()>,
+{
+    match hold {
+        Some(hold) if !hold.native_wayland => release_x11(
+            hold.xid,
+            hold.x.round() as i32,
+            hold.y.round() as i32,
+            hold.button,
+        ),
+        // With no recorded hold, the session-end hook may have raced a native
+        // press before MouseButtonDownTool inserted its state. The persistent
+        // owner is safe to query without starting it; the in-flight completion
+        // path performs the matching cleanup for either backend afterward.
+        Some(_) | None => release_wayland(cursor_id),
+    }
+}
+
+fn release_held_pointer(cursor_id: &str, hold: Option<&MouseHoldState>) -> anyhow::Result<()> {
+    release_held_pointer_with(
+        cursor_id,
+        hold,
+        crate::wayland::persistent_vptr::forget_if_started,
+        crate::input::send_button_up,
+    )
+}
+
+fn cleanup_scoped_pointer_state(state: &ToolState, cursor_id: &str, reason: &str) {
+    let hold = state.mouse_hold.lock().unwrap().remove(cursor_id);
+    if let Err(error) = release_held_pointer(cursor_id, hold.as_ref()) {
+        tracing::warn!(
+            cursor_id,
+            reason,
+            %error,
+            "failed to release held pointer during scoped cleanup"
+        );
+    }
+    crate::overlay::send_command_for(
+        cursor_id.to_owned(),
+        cursor_overlay::OverlayCommand::SetPressed(false),
+    );
+    crate::input::forget_master_pointer(cursor_id);
+}
+
+fn ended_hold_warning_json(cursor_id: &str, status: &str, warning: &str) -> Value {
+    let mut structured = mouse_hold_json(cursor_id, None);
+    structured["cleanup_status"] = json!(status);
+    structured["warning"] = json!(warning);
+    structured
 }
 
 fn held_target_mismatch(
@@ -2486,11 +2578,7 @@ impl Tool for ClickTool {
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            crate::wayland::try_window_local_to_output(xid, x.round() as i32, y.round() as i32).ok()
         } else {
             None
         };
@@ -2512,6 +2600,7 @@ impl Tool for ClickTool {
 
         let (xi, yi) = (x as i32, y as i32);
         let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
+        let (input_x, input_y) = crate::wayland::window_local_to_input(xid, xi, yi);
         let cursor_id_for_task = cursor_id.clone();
         let modifiers_for_task = modifiers.clone();
         // delivery_mode: background (default) = no-focus-steal injection;
@@ -2533,8 +2622,13 @@ impl Tool for ClickTool {
                 // working. (x,y) are screen coords here, matching the frames in
                 // `get_window_state`. Miss → fall through to the injection paths.
                 if !delivery.is_foreground() && button == 1 && count == 1 {
+                    let (screen_x, screen_y) = if crate::wayland::hyprland::is_session() {
+                        crate::wayland::try_window_local_to_output(xid, xi, yi)?
+                    } else {
+                        (output_x, output_y)
+                    };
                     if let Ok(Some(_)) =
-                        crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
+                        crate::atspi::perform_action_at_screen_point(pid, xid, screen_x, screen_y)
                     {
                         return Ok("wayland_atspi");
                     }
@@ -2549,7 +2643,7 @@ impl Tool for ClickTool {
                 // Native Wayland: focus+raise the target toplevel
                 // (foreign-toplevel `activate`), then drive `count` virtual-pointer
                 // button events. Wayland injection routes to the compositor focus.
-                crate::wayland::click(xid, output_x, output_y, count as u32, button)?;
+                crate::wayland::click(xid, input_x, input_y, count as u32, button)?;
                 return Ok("wayland_activate");
             }
             // X11 injection. Tiered no-focus-steal delivery (background):
@@ -4284,11 +4378,11 @@ impl Tool for ScrollTool {
                 }
                 (None, cua_driver_core::element_token::ResolvedElement::None) => None,
             };
-            let output_point = local_point.map(|(x, y)| {
-                crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
+            let input_point = local_point.map(|(x, y)| {
+                crate::wayland::window_local_to_input(xid, x.round() as i32, y.round() as i32)
             });
             let result = tokio::task::spawn_blocking(move || {
-                crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, amount as u32)
+                crate::wayland::scroll_at(xid, input_point, &direction_for_wayland, amount as u32)
             })
             .await;
             return match result {
@@ -4542,7 +4636,7 @@ impl Tool for DoubleClickTool {
                     let lxi = lx as i32;
                     let lyi = ly as i32;
                     let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
+                        .then(|| crate::wayland::window_local_to_input(xid, lxi, lyi));
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result = tokio::task::spawn_blocking(move || {
                         if crate::wayland::is_inject_mode() {
@@ -4607,11 +4701,7 @@ impl Tool for DoubleClickTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            crate::wayland::try_window_local_to_output(xid, x.round() as i32, y.round() as i32).ok()
         } else {
             None
         };
@@ -4631,14 +4721,16 @@ impl Tool for DoubleClickTool {
             );
         }
         let (xi, yi) = (x as i32, y as i32);
+        let wayland_input_point = crate::wayland::wayland_input_enabled()
+            .then(|| crate::wayland::window_local_to_input(xid, xi, yi));
         let cursor_id_for_task = cursor_id.clone();
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if crate::wayland::is_inject_mode() {
                 return crate::wayland::inject_click(pid, xid, x, y, 2, 1);
             }
             if crate::wayland::wayland_input_enabled() {
-                let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::click(xid, output_x, output_y, 2, 1);
+                let (input_x, input_y) = wayland_input_point.unwrap_or((xi, yi));
+                return crate::wayland::click(xid, input_x, input_y, 2, 1);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -4776,7 +4868,7 @@ impl Tool for RightClickTool {
                     let lxi = lx as i32;
                     let lyi = ly as i32;
                     let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
+                        .then(|| crate::wayland::window_local_to_input(xid, lxi, lyi));
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result = tokio::task::spawn_blocking(move || {
                         if crate::wayland::is_inject_mode() {
@@ -4841,11 +4933,7 @@ impl Tool for RightClickTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            crate::wayland::try_window_local_to_output(xid, x.round() as i32, y.round() as i32).ok()
         } else {
             None
         };
@@ -4865,14 +4953,16 @@ impl Tool for RightClickTool {
             );
         }
         let (xi, yi) = (x as i32, y as i32);
+        let wayland_input_point = crate::wayland::wayland_input_enabled()
+            .then(|| crate::wayland::window_local_to_input(xid, xi, yi));
         let cursor_id_for_task = cursor_id.clone();
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if crate::wayland::is_inject_mode() {
                 return crate::wayland::inject_click(pid, xid, x, y, 1, 3);
             }
             if crate::wayland::wayland_input_enabled() {
-                let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::click(xid, output_x, output_y, 1, 3);
+                let (input_x, input_y) = wayland_input_point.unwrap_or((xi, yi));
+                return crate::wayland::click(xid, input_x, input_y, 1, 3);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -5081,14 +5171,32 @@ impl Tool for DragTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        let wayland_points = crate::wayland::wayland_input_enabled().then(|| {
+        let wayland_points = if crate::wayland::wayland_input_enabled() {
+            crate::wayland::try_window_local_to_output(
+                xid,
+                from_x.round() as i32,
+                from_y.round() as i32,
+            )
+            .ok()
+            .zip(
+                crate::wayland::try_window_local_to_output(
+                    xid,
+                    to_x.round() as i32,
+                    to_y.round() as i32,
+                )
+                .ok(),
+            )
+        } else {
+            None
+        };
+        let wayland_input_points = crate::wayland::wayland_input_enabled().then(|| {
             (
-                crate::wayland::window_local_to_output(
+                crate::wayland::window_local_to_input(
                     xid,
                     from_x.round() as i32,
                     from_y.round() as i32,
                 ),
-                crate::wayland::window_local_to_output(
+                crate::wayland::window_local_to_input(
                     xid,
                     to_x.round() as i32,
                     to_y.round() as i32,
@@ -5134,7 +5242,7 @@ impl Tool for DragTool {
                     )
                 })
             } else {
-                let ((fxi, fyi), (txi, tyi)) = wayland_points.unwrap_or((
+                let ((fxi, fyi), (txi, tyi)) = wayland_input_points.unwrap_or((
                     (from_x.round() as i32, from_y.round() as i32),
                     (to_x.round() as i32, to_y.round() as i32),
                 ));
@@ -5432,12 +5540,20 @@ impl Tool for MouseButtonDownTool {
         // Native Wayland: route through the persistent virtual-pointer module
         // so the held button survives across tool calls; the X11 path keeps
         // the existing input::send_button_down behaviour.
-        let result = if crate::wayland::is_wayland() {
-            let cid = cursor_id.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::wayland::persistent_vptr::press(&cid, xid, xi, yi, button)
-            })
-            .await
+        let native_wayland = crate::wayland::is_wayland();
+        let mut pending_press = None;
+        let result = if native_wayland {
+            let (cancellation, reply) =
+                match crate::wayland::persistent_vptr::begin_press(&cursor_id, xid, xi, yi, button)
+                {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        return ToolResult::error(error.to_string())
+                            .with_structured(mouse_hold_json(&cursor_id, None))
+                    }
+                };
+            pending_press = Some(cancellation);
+            tokio::task::spawn_blocking(move || reply.wait()).await
         } else {
             tokio::task::spawn_blocking(move || crate::input::send_button_down(xid, xi, yi, button))
                 .await
@@ -5450,12 +5566,40 @@ impl Tool for MouseButtonDownTool {
                     button,
                     x,
                     y,
+                    native_wayland,
                 };
-                self.state
-                    .mouse_hold
-                    .lock()
-                    .unwrap()
-                    .insert(cursor_id.clone(), hold.clone());
+                let session_ended = {
+                    let mut holds = self.state.mouse_hold.lock().unwrap();
+                    if cua_driver_core::session::is_session_ended(&cursor_id) {
+                        true
+                    } else {
+                        holds.insert(cursor_id.clone(), hold.clone());
+                        false
+                    }
+                };
+                if session_ended {
+                    if let Err(error) = release_held_pointer(&cursor_id, Some(&hold)) {
+                        tracing::warn!(
+                            cursor_id,
+                            %error,
+                            "failed to release a held pointer after its session ended in flight"
+                        );
+                    }
+                    crate::overlay::send_command_for(
+                        cursor_id.clone(),
+                        cursor_overlay::OverlayCommand::SetPressed(false),
+                    );
+                    return ToolResult::error(format!(
+                        "Session '{cursor_id}' ended while mouse_button_down was in flight; \
+                         the held pointer was released."
+                    ))
+                    .with_structured(mouse_hold_json(&cursor_id, None));
+                }
+                if let Some(cancellation) = pending_press.take() {
+                    // The durable ToolState record now owns cleanup. Disarm the
+                    // cancellation guard only after that handoff is complete.
+                    cancellation.commit();
+                }
                 if let Ok(Ok((sx, sy))) =
                     tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y)).await
                 {
@@ -5474,10 +5618,17 @@ impl Tool for MouseButtonDownTool {
                 ))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
             }
-            Ok(Err(e)) => ToolResult::error(e.to_string()).with_structured(mouse_hold_json(
-                &cursor_id,
-                self.state.mouse_hold.lock().unwrap().get(&cursor_id),
-            )),
+            Ok(Err(e)) => {
+                if crate::wayland::persistent_vptr::press_error_preserves_existing(&e) {
+                    if let Some(cancellation) = pending_press.take() {
+                        cancellation.commit();
+                    }
+                }
+                ToolResult::error(e.to_string()).with_structured(mouse_hold_json(
+                    &cursor_id,
+                    self.state.mouse_hold.lock().unwrap().get(&cursor_id),
+                ))
+            }
             Err(e) => {
                 ToolResult::error(format!("Task error: {e}")).with_structured(mouse_hold_json(
                     &cursor_id,
@@ -5590,7 +5741,7 @@ impl Tool for MouseDragTool {
         let mut result: anyhow::Result<()> = Ok(());
         let mut prev_x = from_x;
         let mut prev_y = from_y;
-        let is_wl = crate::wayland::is_wayland();
+        let is_wl = hold.native_wayland;
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
             let ix = from_x + (to_x - from_x) * t;
@@ -5687,8 +5838,22 @@ impl Tool for MouseDragTool {
                 ))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
             }
-            Err(e) => ToolResult::error(e.to_string())
-                .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
+            Err(e) => {
+                let ended = reconcile_ended_persistent_hold(&self.state, &cursor_id, &e);
+                let structured = match ended {
+                    Some(crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled) => {
+                        ended_hold_warning_json(&cursor_id, "canceled", &e.to_string())
+                    }
+                    Some(
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::CleanupFailed,
+                    ) => ended_hold_warning_json(&cursor_id, "failed", &e.to_string()),
+                    Some(
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent,
+                    ) => mouse_hold_json(&cursor_id, None),
+                    None => mouse_hold_json(&cursor_id, Some(&hold)),
+                };
+                ToolResult::error(e.to_string()).with_structured(structured)
+            }
         }
     }
 }
@@ -5777,7 +5942,7 @@ impl Tool for MouseButtonUpTool {
         // Native Wayland: release through the persistent virtual-pointer so
         // the same vptr device that emitted the press also emits the release
         // (single logical drag rather than a click pair).
-        let result = if crate::wayland::is_wayland() {
+        let result = if hold.native_wayland {
             let cid = cursor_id.clone();
             tokio::task::spawn_blocking(move || {
                 crate::wayland::persistent_vptr::release(&cid, button)
@@ -5809,8 +5974,38 @@ impl Tool for MouseButtonUpTool {
                 ))
                 .with_structured(cleared)
             }
-            Ok(Err(e)) => ToolResult::error(e.to_string())
-                .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
+            Ok(Err(e)) => match reconcile_ended_persistent_hold(&self.state, &cursor_id, &e) {
+                Some(
+                    crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent,
+                ) => ToolResult::text(format!(
+                    "Cursor '{cursor_id}' was already released; local held-button state was cleared."
+                ))
+                .with_structured(mouse_hold_json(&cursor_id, None)),
+                Some(kind @ (crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled
+                    | crate::wayland::persistent_vptr::PersistentPointerEndKind::CleanupFailed)) => {
+                    let warning = e.to_string();
+                    let status = match kind {
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled => {
+                            "canceled"
+                        }
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::CleanupFailed => {
+                            "failed"
+                        }
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent => {
+                            unreachable!()
+                        }
+                    };
+                    let summary = if status == "failed" {
+                        "held-button cleanup failed after the gesture ended"
+                    } else {
+                        "held-button gesture was canceled before release"
+                    };
+                    ToolResult::error(format!("Cursor '{cursor_id}' {summary}: {warning}"))
+                    .with_structured(ended_hold_warning_json(&cursor_id, status, &warning))
+                }
+                None => ToolResult::error(e.to_string())
+                    .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
+            },
             Err(e) => ToolResult::error(format!("Task error: {e}"))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
         }
@@ -6182,19 +6377,36 @@ impl Tool for GetScreenSizeTool {
             return result;
         }
         let result = tokio::task::spawn_blocking(|| {
+            if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                return crate::wayland::hyprland::screen_size();
+            }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption).  Wayland/HiDPI X11 callers should query
             // `xrandr --query` for true scale.
             let (w, h) = x11_screen_size()?;
-            Ok::<(u32, u32, f64), anyhow::Error>((w, h, 1.0))
+            Ok::<(u32, u32, f64, i32, i32, String), anyhow::Error>((w, h, 1.0, 0, 0, String::new()))
         })
         .await;
         match result {
             // Matches Swift text format 1:1.
-            Ok(Ok((w, h, scale))) => {
+            Ok(Ok((w, h, scale, origin_x, origin_y, output_name))) => {
+                let hyprland =
+                    crate::wayland::is_wayland() && crate::wayland::hyprland::is_session();
                 ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
-                    .with_structured(json!({ "width": w, "height": h, "scale_factor": scale }))
+                    .with_structured(json!({
+                        "width": w,
+                        "height": h,
+                        "scale_factor": scale,
+                        "origin_x": origin_x,
+                        "origin_y": origin_y,
+                        "output_name": output_name,
+                        "coordinate_space": if hyprland {
+                            "focused_output_logical"
+                        } else {
+                            "screen_physical"
+                        },
+                    }))
             }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -6274,6 +6486,22 @@ impl Tool for GetDesktopStateTool {
             // abort the tool even though the screenshot already succeeded.
             // Only fall back to the X11 root-window geometry off Wayland, so
             // the X11 / XWayland path is unchanged. See #2017 / Sway testing.
+            let hypr_space = if crate::wayland::is_wayland()
+                && crate::wayland::hyprland::is_session()
+            {
+                Some(crate::wayland::hyprland::desktop_capture_space()?)
+            } else {
+                None
+            };
+            if let Some(space) = hypr_space {
+                if space.width.abs_diff(shot_w) > 1 || space.height.abs_diff(shot_h) > 1 {
+                    anyhow::bail!(
+                        "Hyprland desktop capture geometry mismatch: grim returned {shot_w}x{shot_h}, expected {}x{} from enabled-output layout",
+                        space.width,
+                        space.height
+                    );
+                }
+            }
             let (screen_w, screen_h) = if crate::wayland::is_wayland() {
                 (shot_w, shot_h)
             } else {
@@ -6292,12 +6520,20 @@ impl Tool for GetDesktopStateTool {
             } else {
                 Some(B64.encode(&png))
             };
-            Ok((b64, shot_w, shot_h, screen_w, screen_h, written))
+            Ok((
+                b64,
+                shot_w,
+                shot_h,
+                screen_w,
+                screen_h,
+                written,
+                hypr_space,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written))) => {
+            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written, hypr_space))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({
                     "platform": "linux",
@@ -6309,6 +6545,12 @@ impl Tool for GetDesktopStateTool {
                     "scale_factor": 1.0,
                     "screenshot_mime_type": "image/png",
                 });
+                if let Some(space) = hypr_space {
+                    structured["coordinate_space"] = json!("hyprland_desktop_capture");
+                    structured["origin_x"] = json!(space.origin_x);
+                    structured["origin_y"] = json!(space.origin_y);
+                    structured["capture_scale"] = json!(space.scale);
+                }
                 if let Some(b64) = b64_opt {
                     content.push(cua_driver_core::protocol::Content::image_png(b64));
                 }
@@ -6367,6 +6609,23 @@ impl Tool for GetCursorPositionTool {
         // global cursor position. Fall back to the synthetic registry that
         // records every `motion_absolute` this process emits.
         if crate::wayland::is_wayland() {
+            if crate::wayland::hyprland::is_session() {
+                let result =
+                    tokio::task::spawn_blocking(crate::wayland::hyprland::cursor_position).await;
+                return match result {
+                    Ok(Ok((x, y))) => {
+                        ToolResult::text(format!("✅ Cursor at ({x}, {y}) (Hyprland compositor)"))
+                            .with_structured(json!({
+                                "x": x,
+                                "y": y,
+                                "source": "hyprland",
+                                "coordinate_space": "global_logical",
+                            }))
+                    }
+                    Ok(Err(error)) => ToolResult::error(error.to_string()),
+                    Err(error) => ToolResult::error(format!("Task error: {error}")),
+                };
+            }
             return match crate::wayland::last_synth_cursor_pos() {
                 Some((x, y)) => ToolResult::text(
                     format!("✅ Cursor at ({x}, {y}) (synthetic — last move_cursor in this process)")
@@ -6435,21 +6694,42 @@ impl Tool for MoveCursorTool {
                 "xtest_desktop"
             };
             let result = if wayland {
+                let hyprland = crate::wayland::hyprland::is_session();
                 tokio::task::spawn_blocking(move || {
-                    crate::wayland::move_cursor_absolute(None, xi, yi)
+                    let (screen_x, screen_y) = if hyprland {
+                        crate::wayland::hyprland::desktop_capture_to_screen(xi, yi)?
+                    } else {
+                        (xi, yi)
+                    };
+                    crate::wayland::move_cursor_absolute(None, screen_x, screen_y)?;
+                    Ok::<_, anyhow::Error>((screen_x, screen_y))
                 })
                 .await
             } else {
-                tokio::task::spawn_blocking(move || crate::input::send_move_xtest_desktop(xi, yi))
-                    .await
+                tokio::task::spawn_blocking(move || {
+                    crate::input::send_move_xtest_desktop(xi, yi)?;
+                    Ok::<_, anyhow::Error>((xi, yi))
+                })
+                .await
             };
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "Moved the real desktop pointer to ({xi}, {yi})."
+                Ok(Ok((screen_x, screen_y))) => ToolResult::text(format!(
+                    "Moved the real desktop pointer to ({screen_x}, {screen_y})."
                 ))
-                .with_structured(
-                    json!({"scope":"desktop","path":path,"x":xi,"y":yi,"effect":"unverifiable"}),
-                ),
+                .with_structured(json!({
+                    "scope":"desktop",
+                    "path":path,
+                    "x":screen_x,
+                    "y":screen_y,
+                    "capture_x":xi,
+                    "capture_y":yi,
+                    "coordinate_space": if crate::wayland::hyprland::is_session() {
+                        "hyprland_global_logical"
+                    } else {
+                        "desktop_capture"
+                    },
+                    "effect":"unverifiable"
+                })),
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
@@ -7787,14 +8067,9 @@ pub fn build_registry_with_provider(
         let cursor_registry = state.cursor_registry.clone();
         let state_for_session_end = state.clone();
         cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
+            cleanup_scoped_pointer_state(&state_for_session_end, session_id, "session_end");
             cursor_registry.remove(session_id);
             crate::overlay::remove_cursor(session_id.to_owned());
-            state_for_session_end
-                .mouse_hold
-                .lock()
-                .unwrap()
-                .remove(session_id);
-            crate::input::forget_master_pointer(session_id);
         })
     };
     let mut r = ToolRegistry::new_with_protected_consent_provider(provider);
@@ -7803,7 +8078,28 @@ pub fn build_registry_with_provider(
     if let Some(runtime_scope) = cua_driver_core::tool::current_dispatch_runtime_scope() {
         let prefix = format!("__cua_runtime_{runtime_scope}:");
         let cursor_registry = state.cursor_registry.clone();
+        let state_for_runtime_cleanup = state.clone();
         r.retain_runtime_cleanup(move || {
+            let held_cursor_ids = state_for_runtime_cleanup
+                .mouse_hold
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|cursor_id| cursor_id.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for cursor_id in held_cursor_ids {
+                cleanup_scoped_pointer_state(
+                    &state_for_runtime_cleanup,
+                    &cursor_id,
+                    "runtime_cleanup",
+                );
+            }
+            if let Err(error) =
+                crate::wayland::persistent_vptr::forget_runtime_prefix_if_started(&prefix)
+            {
+                tracing::warn!(%error, "failed to clean runtime-scoped Wayland pointer state");
+            }
             for cursor in cursor_registry
                 .all_states()
                 .into_iter()
@@ -8067,5 +8363,105 @@ mod pid_window_target_tests {
             PidWindowTargetResolution::Ambiguous(windows)
                 if windows.iter().map(|window| window.window_id).collect::<Vec<_>>() == [7, 8]
         ));
+    }
+}
+
+#[cfg(test)]
+mod persistent_hold_reconciliation_tests {
+    use super::{
+        reconcile_ended_persistent_hold, release_held_pointer_with, runtime_scoped_default_cursor,
+        MouseHoldState, ToolState,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn hold(native_wayland: bool) -> MouseHoldState {
+        MouseHoldState {
+            pid: 7,
+            xid: 9,
+            button: 1,
+            x: 10.4,
+            y: 20.6,
+            native_wayland,
+        }
+    }
+
+    #[test]
+    fn canceled_persistent_gesture_clears_tool_hold_state() {
+        let state = ToolState::new();
+        state
+            .mouse_hold
+            .lock()
+            .unwrap()
+            .insert("cursor-a".to_owned(), hold(false));
+        let error = anyhow::Error::new(
+            crate::wayland::persistent_vptr::PersistentPointerError::GestureCanceled(
+                "cross-output gesture canceled".to_owned(),
+            ),
+        );
+        assert_eq!(
+            reconcile_ended_persistent_hold(&state, "cursor-a", &error),
+            Some(crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled)
+        );
+        assert!(!state.mouse_hold.lock().unwrap().contains_key("cursor-a"));
+    }
+
+    #[test]
+    fn already_absent_cleanup_is_classified_as_benign() {
+        let state = ToolState::new();
+        let error = anyhow::Error::new(
+            crate::wayland::persistent_vptr::PersistentPointerError::AlreadyAbsent(
+                "already gone".to_owned(),
+            ),
+        );
+        assert_eq!(
+            reconcile_ended_persistent_hold(&state, "cursor-a", &error),
+            Some(crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent)
+        );
+    }
+
+    #[test]
+    fn scoped_cleanup_releases_through_the_recorded_backend() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        for (native_wayland, expected) in [(false, "x11"), (true, "wayland")] {
+            let wayland_calls = calls.clone();
+            let x11_calls = calls.clone();
+            release_held_pointer_with(
+                "cursor-a",
+                Some(&hold(native_wayland)),
+                move |cursor_id| {
+                    wayland_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("wayland:{cursor_id}"));
+                    Ok(())
+                },
+                move |xid, x, y, button| {
+                    x11_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("x11:{xid}:{x}:{y}:{button}"));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(calls.lock().unwrap().last().unwrap().starts_with(expected));
+        }
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["x11:9:10:21:1", "wayland:cursor-a"]
+        );
+    }
+
+    #[test]
+    fn default_cursor_is_isolated_between_runtime_scopes() {
+        let first = cua_driver_core::tool::with_runtime_scope("runtime-a".to_owned(), || {
+            runtime_scoped_default_cursor("default")
+        });
+        let second = cua_driver_core::tool::with_runtime_scope("runtime-b".to_owned(), || {
+            runtime_scoped_default_cursor("default")
+        });
+        assert_eq!(first, "__cua_runtime_runtime-a:default");
+        assert_eq!(second, "__cua_runtime_runtime-b:default");
+        assert_ne!(first, second);
     }
 }

@@ -356,7 +356,7 @@ fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
                     }
                     _ => {}
                 }
-            } else if !crate::wayland::shell_helper::available() {
+            } else if crate::wayland::overlay::should_use_native_overlay() {
                 let _ = crate::wayland::overlay::forward(&msg);
             }
         }
@@ -509,11 +509,18 @@ pub fn remove_cursor(key: CursorKey) {
     }
     let msg = OverlayMsg::Remove(key);
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(msg.clone());
+        if tx.try_send(msg.clone()).is_err() {
+            tracing::warn!("cursor state channel full while removing overlay");
+        }
     }
     #[cfg(target_os = "linux")]
-    if crate::wayland::is_wayland() && !crate::wayland::shell_helper::available() {
-        let _ = crate::wayland::overlay::forward(&msg);
+    if crate::wayland::is_wayland()
+        && !crate::wayland::shell_helper::available()
+        && crate::wayland::overlay::should_use_native_overlay()
+    {
+        if !crate::wayland::overlay::forward(&msg) {
+            tracing::warn!("Wayland overlay channel unavailable while removing cursor");
+        }
     }
 }
 
@@ -546,6 +553,22 @@ pub fn run_on_thread() {
     // thread spins up on demand without losing any commands (the
     // first send_command_for that triggers it spawns the thread,
     // future commands reuse it).
+
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland()
+        && (crate::wayland::shell_helper::available()
+            || crate::wayland::overlay::should_use_native_overlay())
+    {
+        // Wayland pixels are rendered by either the compositor helper or the
+        // layer-shell owner. Retain a lightweight state loop for cursor
+        // registries and arrival waiters without creating a duplicate XWayland
+        // window. Mixed sessions without either native renderer keep X11.
+        std::thread::Builder::new()
+            .name("cua-overlay-state".into())
+            .spawn(move || run_state_thread(rx))
+            .expect("spawn overlay state thread");
+        return;
+    }
 
     std::thread::Builder::new()
         .name("cua-overlay-x11".into())
@@ -591,34 +614,40 @@ impl RenderState {
     /// quiescent, so an idle MCP server can park on bounded maintenance waits
     /// instead of rebuilding and repainting X11 cursor tiles at 60 fps.
     #[cfg(target_os = "linux")]
-    fn needs_frame_tick(&self) -> bool {
+    fn needs_transient_tick(&self) -> bool {
         let fade_start = self.core.motion.idle_hide_ms / 1000.0;
         self.core.path.is_some()
             || self.core.spring.is_some()
             || self.core.click_t.is_some()
             || self.core.session_badge_needs_frame_tick()
-            // The resting float bob (`shared_float_motion`) is part of the
-            // cursor's visual identity, not a transient animation: it runs
-            // whenever the cursor is on screen and reduced motion is off, so
-            // a settled cursor must keep receiving frames or the bob freezes
-            // mid-swing on Linux while macOS keeps levitating. The term dies
-            // with `idle_alpha` once the idle fade completes, returning the
-            // parked-overlay fast path to the fully hidden cursor.
-            || (self.core.visible
-                && self.core.pos.0 >= -100.0
-                && self.core.idle_alpha >= 0.004
-                && self.core.visual.reduced_motion != cursor_overlay::ReducedMotion::On)
             || (self.core.motion.idle_hide_ms > 0.0
                 && self.core.visible
                 && self.core.pos.0 >= -100.0
                 && self.core.idle_secs >= fade_start
                 && self.core.idle_alpha >= 0.004)
     }
+
+    #[cfg(target_os = "linux")]
+    fn needs_frame_tick(&self) -> bool {
+        self.needs_transient_tick()
+            // The resting float bob (`shared_float_motion`) is part of the
+            // rendered X11 cursor's visual identity. State-only ownership
+            // must exclude it because that thread paints no pixels.
+            || (self.core.visible
+                && self.core.pos.0 >= -100.0
+                && self.core.idle_alpha >= 0.004
+                && self.core.visual.reduced_motion != cursor_overlay::ReducedMotion::On)
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn render_map_needs_frame_tick(map: &RenderMap) -> bool {
     map.cursors.values().any(RenderState::needs_frame_tick)
+}
+
+#[cfg(target_os = "linux")]
+fn render_map_needs_state_tick(map: &RenderMap) -> bool {
+    map.cursors.values().any(RenderState::needs_transient_tick)
 }
 
 #[cfg(target_os = "linux")]
@@ -949,6 +978,69 @@ fn map_x11_overlay_with_empty_input(
 }
 
 // ── X11 thread ────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn run_state_thread(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
+    let cleanup = X11OverlayThreadCleanup {
+        receiver: Some(rx),
+        disable_render_state: false,
+    };
+    let frame = Duration::from_millis(16);
+    let mut last_tick = Instant::now();
+    let mut frame_tick_needed = false;
+    loop {
+        let idle_wait = RENDER
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(render_map_idle_wait_interval));
+        let wake = if frame_tick_needed {
+            match cleanup.receiver().recv_timeout(frame) {
+                Ok(msg) => OverlayWake::Message(msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => OverlayWake::Frame,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => OverlayWake::Disconnected,
+            }
+        } else if let Some(wait) = idle_wait {
+            match cleanup.receiver().recv_timeout(wait) {
+                Ok(msg) => OverlayWake::Message(msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => OverlayWake::MaintenanceTimeout,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => OverlayWake::Disconnected,
+            }
+        } else {
+            match cleanup.receiver().recv() {
+                Ok(msg) => OverlayWake::Message(msg),
+                Err(_) => OverlayWake::Disconnected,
+            }
+        };
+        let (first_msg, maintenance_timeout) = match wake {
+            OverlayWake::Frame => (None, false),
+            OverlayWake::Message(msg) => (Some(msg), false),
+            OverlayWake::MaintenanceTimeout => (None, true),
+            OverlayWake::Disconnected => break,
+        };
+        let now = Instant::now();
+        let dt = now.duration_since(last_tick).as_secs_f64();
+        last_tick = now;
+        let arrived = {
+            let mut guard = RENDER.lock().unwrap();
+            let Some(map) = guard.as_mut() else {
+                break;
+            };
+            let (arrived, _) = process_render_wake(
+                map,
+                first_msg,
+                cleanup.receiver(),
+                dt,
+                maintenance_timeout,
+                frame_tick_needed,
+            );
+            frame_tick_needed = render_map_needs_state_tick(map);
+            arrived
+        };
+        for key in &arrived {
+            arrival_fire(key);
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
@@ -3433,6 +3525,17 @@ mod tests {
         let cursor = map.cursors.get_mut("default").unwrap();
         cursor.core.idle_alpha = 0.0;
         assert!(!render_map_needs_frame_tick(&map));
+    }
+
+    #[test]
+    fn state_only_owner_excludes_resting_float_bob() {
+        let mut map = default_render_map();
+        let cursor = map.cursors.get_mut("default").unwrap();
+        cursor.core.pos = (100.0, 100.0);
+        cursor.core.motion.idle_hide_ms = 0.0;
+
+        assert!(render_map_needs_frame_tick(&map));
+        assert!(!render_map_needs_state_tick(&map));
     }
 
     #[test]

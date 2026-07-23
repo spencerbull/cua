@@ -65,6 +65,24 @@ pub fn set_config_enabled(enabled: bool) {
     CONFIG_ENABLED.store(enabled, Ordering::Release);
 }
 
+/// Select native layer-shell rendering when no X11 fallback exists, or when
+/// explicitly requested in a mixed Wayland/XWayland session. This prevents
+/// duplicate overlays while preserving the mature X11 renderer by default.
+pub fn should_use_native_overlay() -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return false;
+    }
+    if std::env::var_os("DISPLAY").is_none() {
+        return true;
+    }
+    std::env::var("CUA_DRIVER_RS_ENABLE_WAYLAND_OVERLAY")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+}
+
 fn tx() -> Option<&'static Sender<WlOverlayCmd>> {
     TX.get()
 }
@@ -111,17 +129,16 @@ pub fn forward(msg: &OverlayMsg) -> bool {
     match msg {
         OverlayMsg::Remove(k) => {
             let _ = k;
-            let _ = tx.try_send(WlOverlayCmd::Remove);
-            true
+            tx.try_send(WlOverlayCmd::Remove).is_ok()
         }
         OverlayMsg::Cmd(kc) => {
             if matches!(&kc.cmd, OverlayCommand::ShowFocusRect(_)) {
                 return false;
             }
-            let _ = tx.try_send(WlOverlayCmd::Cmd {
+            tx.try_send(WlOverlayCmd::Cmd {
                 cmd: kc.cmd.clone(),
-            });
-            true
+            })
+            .is_ok()
         }
     }
 }
@@ -173,6 +190,14 @@ struct OverlayState {
 // requires for State types apply to the struct as a whole, hence the
 // explicit assertion.
 unsafe impl Send for OverlayState {}
+
+impl Drop for OverlayState {
+    fn drop(&mut self) {
+        for (_, (ptr, size, fd)) in std::mem::take(&mut self.pending_buffers) {
+            super::cleanup_mmap(ptr, size, fd);
+        }
+    }
+}
 
 impl Default for OverlayState {
     fn default() -> Self {

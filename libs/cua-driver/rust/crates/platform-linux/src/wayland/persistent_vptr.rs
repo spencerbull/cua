@@ -28,25 +28,70 @@
 //!   command on a fresh one, emitting a typed error for the in-flight call.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use wayland_client::{protocol::wl_pointer::ButtonState, Connection};
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
-use super::{evdev_pointer_button, open_vptr_session};
+use super::{evdev_pointer_button, open_vptr_session_at};
+
+#[derive(Debug)]
+pub(crate) enum PersistentPointerError {
+    AlreadyActive(String),
+    GestureCanceled(String),
+    AlreadyAbsent(String),
+    GestureEnded(String),
+}
+
+impl std::fmt::Display for PersistentPointerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyActive(message)
+            | Self::GestureCanceled(message)
+            | Self::AlreadyAbsent(message)
+            | Self::GestureEnded(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PersistentPointerError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersistentPointerEndKind {
+    AlreadyAbsent,
+    Canceled,
+    CleanupFailed,
+}
+
+pub(crate) fn gesture_end_kind(error: &anyhow::Error) -> Option<PersistentPointerEndKind> {
+    match error.downcast_ref::<PersistentPointerError>()? {
+        PersistentPointerError::AlreadyActive(_) => None,
+        PersistentPointerError::AlreadyAbsent(_) => Some(PersistentPointerEndKind::AlreadyAbsent),
+        PersistentPointerError::GestureCanceled(_) => Some(PersistentPointerEndKind::Canceled),
+        PersistentPointerError::GestureEnded(_) => Some(PersistentPointerEndKind::CleanupFailed),
+    }
+}
 
 /// One in-flight command from the public API to the owner thread.
 enum Cmd {
     Press {
         cursor_id: String,
+        attempt_id: u64,
         window_id: u64,
         x: i32,
         y: i32,
         button: u8,
+        canceled: Arc<AtomicBool>,
         reply: Sender<anyhow::Result<()>>,
     },
+    /// Cancel only the matching in-flight press. An old async task must never
+    /// tear down a newer pointer that reused the same cursor ID.
+    CancelAttempt { cursor_id: String, attempt_id: u64 },
     MoveTo {
         cursor_id: String,
         x: i32,
@@ -58,16 +103,20 @@ enum Cmd {
         button: u8,
         reply: Sender<anyhow::Result<()>>,
     },
-    /// Drop the entry for a cursor_id without sending wire events — used to
-    /// recover when the compositor disconnected mid-life.
+    /// Release held buttons and drop the entry for a cursor_id.
     Forget {
         cursor_id: String,
+        reply: Sender<anyhow::Result<()>>,
+    },
+    ForgetPrefix {
+        prefix: String,
         reply: Sender<anyhow::Result<()>>,
     },
 }
 
 /// State held inside the owner thread for one cursor_id.
 struct ActivePointer {
+    attempt_id: u64,
     vptr: ZwlrVirtualPointerV1,
     /// evdev codes of buttons currently held down. When this set becomes
     /// empty the vptr is destroyed and the entry dropped from the map.
@@ -75,15 +124,41 @@ struct ActivePointer {
     /// Output extent at session open time — needed for motion_absolute.
     out_w: u32,
     out_h: u32,
+    window_id: u64,
+    output_name: Option<String>,
+    focus_lease: Option<super::hyprland::FocusLease>,
 }
 
 /// Process-global command channel into the owner thread. Lazily started on
 /// first use.
 static TX: OnceLock<Sender<Cmd>> = OnceLock::new();
 
+#[derive(Clone)]
+struct PendingAttempt {
+    attempt_id: u64,
+    canceled: Arc<AtomicBool>,
+}
+
+fn pending_presses() -> &'static Mutex<HashMap<String, PendingAttempt>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingAttempt>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn clear_pending_attempt(cursor_id: &str, attempt_id: u64) {
+    let mut pending = pending_presses().lock().unwrap();
+    if pending
+        .get(cursor_id)
+        .is_some_and(|attempt| attempt.attempt_id == attempt_id)
+    {
+        pending.remove(cursor_id);
+    }
+}
+
 fn tx() -> &'static Sender<Cmd> {
     TX.get_or_init(|| {
-        let (tx, rx) = bounded::<Cmd>(32);
+        // Cleanup is sent from cancellation-guard Drop and must never be lost
+        // merely because an owner queue is full.
+        let (tx, rx) = unbounded::<Cmd>();
         thread::Builder::new()
             .name("cua-persistent-vptr".into())
             .spawn(move || owner_thread(rx))
@@ -98,14 +173,52 @@ fn owner_thread(rx: Receiver<Cmd>) {
         match cmd {
             Cmd::Press {
                 cursor_id,
+                attempt_id,
                 window_id,
                 x,
                 y,
                 button,
+                canceled,
                 reply,
             } => {
-                let r = handle_press(&mut active, &cursor_id, window_id, x, y, button);
+                let mut r = if canceled.load(Ordering::Acquire) {
+                    Err(anyhow::anyhow!(
+                        "persistent pointer press was canceled before delivery"
+                    ))
+                } else {
+                    handle_press(&mut active, &cursor_id, attempt_id, window_id, x, y, button)
+                };
+                // The caller may be canceled while Wayland focus/input work is
+                // in flight. Never publish success with a live orphan: release
+                // the just-created device and its focus lease before replying.
+                if r.is_ok() && canceled.load(Ordering::Acquire) {
+                    r = release_attempt_and_forget(&mut active, &cursor_id, attempt_id).and_then(
+                        |()| {
+                            Err(anyhow::anyhow!(
+                            "persistent pointer press was canceled after delivery and cleaned up"
+                        ))
+                        },
+                    );
+                }
+                if canceled.load(Ordering::Acquire) {
+                    clear_pending_attempt(&cursor_id, attempt_id);
+                }
                 let _ = reply.send(r);
+            }
+            Cmd::CancelAttempt {
+                cursor_id,
+                attempt_id,
+            } => {
+                if let Err(error) = release_attempt_and_forget(&mut active, &cursor_id, attempt_id)
+                {
+                    tracing::warn!(
+                        %error,
+                        cursor_id,
+                        attempt_id,
+                        "failed to clean a canceled persistent pointer press"
+                    );
+                }
+                clear_pending_attempt(&cursor_id, attempt_id);
             }
             Cmd::MoveTo {
                 cursor_id,
@@ -125,10 +238,21 @@ fn owner_thread(rx: Receiver<Cmd>) {
                 let _ = reply.send(r);
             }
             Cmd::Forget { cursor_id, reply } => {
-                if let Some(p) = active.remove(&cursor_id) {
-                    p.vptr.destroy();
+                let _ = reply.send(release_all_and_forget(&mut active, &cursor_id));
+            }
+            Cmd::ForgetPrefix { prefix, reply } => {
+                let keys = active
+                    .keys()
+                    .filter(|cursor_id| cursor_id.starts_with(&prefix))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut result = Ok(());
+                for cursor_id in keys {
+                    if let Err(error) = release_all_and_forget(&mut active, &cursor_id) {
+                        result = Err(error);
+                    }
                 }
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(result);
             }
         }
     }
@@ -137,20 +261,27 @@ fn owner_thread(rx: Receiver<Cmd>) {
 fn handle_press(
     active: &mut HashMap<String, ActivePointer>,
     cursor_id: &str,
+    attempt_id: u64,
     window_id: u64,
     x: i32,
     y: i32,
     button: u8,
 ) -> anyhow::Result<()> {
+    ensure_press_slot_available(active, cursor_id)?;
     // Open a fresh session for this press — this binds the seat, the foreign-
     // toplevel manager, activates the target window, and creates a new vptr.
     // Keep the (out_w, out_h) but drop the queue + state at end of scope; the
     // vptr itself remains alive (Wayland objects survive their original queue
     // as long as the Connection is alive).
-    let mut sess = open_vptr_session(Some(window_id))?;
+    let mut sess = open_vptr_session_at(Some(window_id), Some((x, y)))?;
+    sess.refresh_hypr_window_target()?;
     let (w, h) = (sess.output_w, sess.output_h);
-    let px = x.clamp(0, w as i32 - 1) as u32;
-    let py = y.clamp(0, h as i32 - 1) as u32;
+    let px = sess
+        .target_x
+        .unwrap_or_else(|| x.clamp(0, w as i32 - 1) as u32);
+    let py = sess
+        .target_y
+        .unwrap_or_else(|| y.clamp(0, h as i32 - 1) as u32);
     let btn = evdev_pointer_button(button);
 
     sess.vptr.motion_absolute(0, px, py, w, h);
@@ -167,19 +298,51 @@ fn handle_press(
     // (the session goes out of scope; we need the conn alive).
     // We do this by leaking the connection into a process-static slot keyed by
     // cursor_id. Subsequent commands on the same cursor reuse this conn.
-    persist_conn(cursor_id, sess.conn);
+    persist_conn(cursor_id, sess.conn.clone());
 
     let mut held = HashSet::new();
     held.insert(btn);
     active.insert(
         cursor_id.to_string(),
         ActivePointer {
+            attempt_id,
             vptr,
             held,
             out_w: w,
             out_h: h,
+            window_id,
+            output_name: sess.target_output_name.take(),
+            focus_lease: sess.hypr_focus_lease.take(),
         },
     );
+    Ok(())
+}
+
+fn release_attempt_and_forget(
+    active: &mut HashMap<String, ActivePointer>,
+    cursor_id: &str,
+    attempt_id: u64,
+) -> anyhow::Result<()> {
+    if active
+        .get(cursor_id)
+        .is_some_and(|entry| entry.attempt_id == attempt_id)
+    {
+        release_all_and_forget(active, cursor_id)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_press_slot_available<T>(
+    active: &HashMap<String, T>,
+    cursor_id: &str,
+) -> anyhow::Result<()> {
+    if active.contains_key(cursor_id) {
+        return Err(PersistentPointerError::AlreadyActive(format!(
+            "cursor '{cursor_id}' already owns a persistent held pointer; release it before pressing again"
+        ))
+        .into());
+    }
     Ok(())
 }
 
@@ -189,19 +352,100 @@ fn handle_move(
     x: i32,
     y: i32,
 ) -> anyhow::Result<()> {
-    let entry = active.get_mut(cursor_id).ok_or_else(|| {
+    let entry = active.get(cursor_id).ok_or_else(|| {
         anyhow::anyhow!(
             "no held mouse button for cursor '{cursor_id}'; call mouse_button_down first"
         )
     })?;
-    let px = x.clamp(0, entry.out_w as i32 - 1) as u32;
-    let py = y.clamp(0, entry.out_h as i32 - 1) as u32;
+    let mapped = if let Some(output_name) = entry.output_name.as_deref() {
+        let target = super::hyprland::window_capture_pointer_target(entry.window_id, x, y)?;
+        if target.output_name != output_name
+            || target.output_width != entry.out_w
+            || target.output_height != entry.out_h
+        {
+            None
+        } else {
+            Some((target.output_x, target.output_y))
+        }
+    } else {
+        Some((
+            x.clamp(0, entry.out_w as i32 - 1) as u32,
+            y.clamp(0, entry.out_h as i32 - 1) as u32,
+        ))
+    };
+    let Some((px, py)) = mapped else {
+        let output_name = entry.output_name.clone().unwrap_or_default();
+        let cleanup = release_all_and_forget(active, cursor_id);
+        let message = format!(
+            "Hyprland held-pointer move leaves bound output {output_name}; the held gesture was canceled and its buttons released"
+        );
+        return match cleanup {
+            Ok(()) => Err(PersistentPointerError::GestureCanceled(message).into()),
+            Err(error) => Err(PersistentPointerError::GestureEnded(format!(
+                "{message}, but cleanup reported: {error}"
+            ))
+            .into()),
+        };
+    };
+    let entry = active
+        .get(cursor_id)
+        .expect("active pointer remains after an in-output move");
     entry
         .vptr
         .motion_absolute(0, px, py, entry.out_w, entry.out_h);
     entry.vptr.frame();
-    roundtrip_on_persistent(cursor_id)?;
+    if let Err(error) = roundtrip_on_persistent(cursor_id) {
+        let cleanup = release_all_and_forget(active, cursor_id);
+        return Err(PersistentPointerError::GestureEnded(format!(
+            "persistent pointer '{cursor_id}' ended after motion delivery failed: {error}; cleanup result: {}",
+            cleanup
+                .map(|_| "completed".to_owned())
+                .unwrap_or_else(|cleanup| cleanup.to_string())
+        ))
+        .into());
+    }
     Ok(())
+}
+
+fn held_buttons_for_release(held: &HashSet<u32>) -> Vec<u32> {
+    let mut buttons = held.iter().copied().collect::<Vec<_>>();
+    buttons.sort_unstable();
+    buttons
+}
+
+fn release_all_and_forget(
+    active: &mut HashMap<String, ActivePointer>,
+    cursor_id: &str,
+) -> anyhow::Result<()> {
+    let release_result = if let Some(entry) = active.get(cursor_id) {
+        for button in held_buttons_for_release(&entry.held) {
+            entry.vptr.button(0, button, ButtonState::Released);
+        }
+        entry.vptr.frame();
+        roundtrip_on_persistent(cursor_id)
+    } else {
+        Ok(())
+    };
+    let finalize_result = if let Some(entry) = active.remove(cursor_id) {
+        finalize_removed_pointer(cursor_id, entry)
+    } else {
+        Ok(())
+    };
+    forget_conn(cursor_id);
+    match release_result.and(finalize_result) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(PersistentPointerError::GestureEnded(format!(
+            "persistent pointer '{cursor_id}' ended, but cleanup failed: {error}"
+        ))
+        .into()),
+    }
+}
+
+fn finalize_removed_pointer(cursor_id: &str, mut entry: ActivePointer) -> anyhow::Result<()> {
+    entry.vptr.destroy();
+    let roundtrip = roundtrip_on_persistent(cursor_id);
+    let restore = super::hyprland::restore_temporary_focus(entry.focus_lease.take()).map(|_| ());
+    roundtrip.and(restore)
 }
 
 fn handle_release(
@@ -210,20 +454,41 @@ fn handle_release(
     button: u8,
 ) -> anyhow::Result<()> {
     let btn = evdev_pointer_button(button);
+    {
+        let entry = active.get_mut(cursor_id).ok_or_else(|| {
+            PersistentPointerError::AlreadyAbsent(format!(
+                "no held mouse button for cursor '{cursor_id}'; it may already have been canceled"
+            ))
+        })?;
+        entry.vptr.button(0, btn, ButtonState::Released);
+        entry.vptr.frame();
+    }
+    if let Err(error) = roundtrip_on_persistent(cursor_id) {
+        let cleanup = release_all_and_forget(active, cursor_id);
+        return Err(PersistentPointerError::GestureEnded(format!(
+            "persistent pointer '{cursor_id}' ended after release delivery failed: {error}; cleanup result: {}",
+            cleanup
+                .map(|_| "completed".to_owned())
+                .unwrap_or_else(|cleanup| cleanup.to_string())
+        ))
+        .into());
+    }
     let drop_entry = {
         let entry = active
             .get_mut(cursor_id)
-            .ok_or_else(|| anyhow::anyhow!("no held mouse button for cursor '{cursor_id}'"))?;
-        entry.vptr.button(0, btn, ButtonState::Released);
-        entry.vptr.frame();
-        roundtrip_on_persistent(cursor_id)?;
+            .expect("active pointer remains after a successful release roundtrip");
         entry.held.remove(&btn);
         entry.held.is_empty()
     };
     if drop_entry {
-        if let Some(p) = active.remove(cursor_id) {
-            p.vptr.destroy();
-            roundtrip_on_persistent(cursor_id).ok();
+        if let Some(entry) = active.remove(cursor_id) {
+            if let Err(error) = finalize_removed_pointer(cursor_id, entry) {
+                forget_conn(cursor_id);
+                return Err(PersistentPointerError::GestureEnded(format!(
+                    "persistent pointer '{cursor_id}' ended, but cleanup failed: {error}"
+                ))
+                .into());
+            }
         }
         forget_conn(cursor_id);
     }
@@ -271,24 +536,136 @@ fn roundtrip_on_persistent(cursor_id: &str) -> anyhow::Result<()> {
 
 // ── public API ────────────────────────────────────────────────────────────
 
+pub(crate) struct PendingPressCancellation {
+    cursor_id: String,
+    attempt_id: u64,
+    canceled: Arc<AtomicBool>,
+    committed: bool,
+}
+
+impl PendingPressCancellation {
+    pub(crate) fn commit(mut self) {
+        clear_pending_attempt(&self.cursor_id, self.attempt_id);
+        self.committed = true;
+    }
+}
+
+pub(crate) fn press_error_preserves_existing(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PersistentPointerError>(),
+        Some(PersistentPointerError::AlreadyActive(_))
+    )
+}
+
+impl Drop for PendingPressCancellation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Keep the reservation present while cancellation is handed to the
+        // owner. A replacement attempt cannot overtake cleanup for this one.
+        self.canceled.store(true, Ordering::Release);
+        if let Some(tx) = TX.get() {
+            // The owner channel preserves Press -> CancelAttempt ordering. Sending is
+            // intentionally fire-and-forget from Drop so task cancellation
+            // cannot block an async executor thread.
+            if tx
+                .try_send(Cmd::CancelAttempt {
+                    cursor_id: self.cursor_id.clone(),
+                    attempt_id: self.attempt_id,
+                })
+                .is_err()
+            {
+                clear_pending_attempt(&self.cursor_id, self.attempt_id);
+            }
+        } else {
+            clear_pending_attempt(&self.cursor_id, self.attempt_id);
+        }
+    }
+}
+
+pub(crate) struct PendingPressReply {
+    reply: Receiver<anyhow::Result<()>>,
+}
+
+impl PendingPressReply {
+    pub(crate) fn wait(self) -> anyhow::Result<()> {
+        self.reply
+            .recv()
+            .map_err(|error| anyhow::anyhow!("reply channel closed: {error}"))?
+    }
+}
+
+/// Reserve and enqueue a press while returning a cancellation guard that must
+/// remain in the invoking async task. Dropping the guard cancels queued work or
+/// releases a press that completed after its caller disappeared.
+pub(crate) fn begin_press(
+    cursor_id: &str,
+    window_id: u64,
+    x: i32,
+    y: i32,
+    button: u8,
+) -> anyhow::Result<(PendingPressCancellation, PendingPressReply)> {
+    static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+    let attempt_id = NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+    let canceled = Arc::new(AtomicBool::new(false));
+    {
+        let mut pending = pending_presses().lock().unwrap();
+        anyhow::ensure!(
+            !pending.contains_key(cursor_id),
+            "cursor '{cursor_id}' already has a persistent pointer press in flight"
+        );
+        pending.insert(
+            cursor_id.to_owned(),
+            PendingAttempt {
+                attempt_id,
+                canceled: canceled.clone(),
+            },
+        );
+    }
+    let (tx_r, rx_r) = bounded(1);
+    if let Err(error) = tx().send(Cmd::Press {
+        cursor_id: cursor_id.to_owned(),
+        attempt_id,
+        window_id,
+        x,
+        y,
+        button,
+        canceled: canceled.clone(),
+        reply: tx_r,
+    }) {
+        clear_pending_attempt(cursor_id, attempt_id);
+        return Err(anyhow::anyhow!(
+            "cua-persistent-vptr thread is dead: {error}"
+        ));
+    }
+    Ok((
+        PendingPressCancellation {
+            cursor_id: cursor_id.to_owned(),
+            attempt_id,
+            canceled,
+            committed: false,
+        },
+        PendingPressReply { reply: rx_r },
+    ))
+}
+
 /// Press and HOLD `button` (evdev code) at output coordinates `(x, y)` on the
 /// toplevel identified by `window_id`. Subsequent `move_to` / `release` calls
 /// targeting the same `cursor_id` reuse the same virtual-pointer device, so
 /// the compositor treats the sequence as one logical drag rather than as
 /// independent clicks. Errors if `cursor_id` already has a held button.
 pub fn press(cursor_id: &str, window_id: u64, x: i32, y: i32, button: u8) -> anyhow::Result<()> {
-    let (tx_r, rx_r) = bounded(1);
-    tx().send(Cmd::Press {
-        cursor_id: cursor_id.to_string(),
-        window_id,
-        x,
-        y,
-        button,
-        reply: tx_r,
-    })
-    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
-    rx_r.recv()
-        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+    let (cancellation, reply) = begin_press(cursor_id, window_id, x, y, button)?;
+    let result = reply.wait();
+    if result.is_ok()
+        || result
+            .as_ref()
+            .is_err_and(|error| press_error_preserves_existing(error))
+    {
+        cancellation.commit();
+    }
+    result
 }
 
 /// Emit motion_absolute on the held cursor's virtual-pointer. Errors if there
@@ -320,10 +697,7 @@ pub fn release(cursor_id: &str, button: u8) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
 }
 
-/// Drop the entry for `cursor_id` without emitting any Wayland events.
-/// Useful for recovery — if the agent thinks a button is held but the
-/// compositor disagrees, this clears the local state without trying to
-/// send a release that would error.
+/// Release every held button and drop the entry for `cursor_id`.
 pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
     let (tx_r, rx_r) = bounded(1);
     tx().send(Cmd::Forget {
@@ -333,4 +707,120 @@ pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
     rx_r.recv()
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
+/// Release a pointer only when the owner thread has already been started.
+///
+/// Scoped teardown uses this for race-safe cleanup even when the higher-level
+/// hold registry has not yet recorded a successful press. Unlike [`forget`],
+/// this never creates a Wayland worker for an X11-only runtime.
+pub fn forget_if_started(cursor_id: &str) -> anyhow::Result<()> {
+    if let Some(attempt) = pending_presses().lock().unwrap().get(cursor_id).cloned() {
+        attempt.canceled.store(true, Ordering::Release);
+    }
+    let Some(tx) = TX.get() else {
+        return Ok(());
+    };
+    let (tx_r, rx_r) = bounded(1);
+    tx.send(Cmd::Forget {
+        cursor_id: cursor_id.to_string(),
+        reply: tx_r,
+    })
+    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
+    rx_r.recv()
+        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
+/// Cancel every pending press owned by a runtime and release all of its active
+/// persistent devices. Runtime teardown uses the unforgeable scope prefix, so
+/// one registry cannot release another registry's default cursor.
+pub(crate) fn forget_runtime_prefix_if_started(prefix: &str) -> anyhow::Result<()> {
+    for canceled in pending_presses()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(cursor_id, _)| cursor_id.starts_with(prefix))
+        .map(|(_, attempt)| attempt.canceled.clone())
+        .collect::<Vec<_>>()
+    {
+        canceled.store(true, Ordering::Release);
+    }
+    let Some(tx) = TX.get() else {
+        return Ok(());
+    };
+    let (tx_r, rx_r) = bounded(1);
+    tx.send(Cmd::ForgetPrefix {
+        prefix: prefix.to_owned(),
+        reply: tx_r,
+    })
+    .map_err(|error| anyhow::anyhow!("cua-persistent-vptr thread is dead: {error}"))?;
+    rx_r.recv()
+        .map_err(|error| anyhow::anyhow!("reply channel closed: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ended_pointer_errors_preserve_benign_and_failed_outcomes() {
+        let already_absent = anyhow::Error::new(PersistentPointerError::AlreadyAbsent(
+            "already gone".to_owned(),
+        ));
+        assert_eq!(
+            gesture_end_kind(&already_absent),
+            Some(PersistentPointerEndKind::AlreadyAbsent)
+        );
+
+        for error in [
+            (
+                PersistentPointerError::GestureCanceled("crossed output".to_owned()),
+                PersistentPointerEndKind::Canceled,
+            ),
+            (
+                PersistentPointerError::GestureEnded("restore failed".to_owned()),
+                PersistentPointerEndKind::CleanupFailed,
+            ),
+        ] {
+            assert_eq!(
+                gesture_end_kind(&anyhow::Error::new(error.0)),
+                Some(error.1)
+            );
+        }
+        assert_eq!(
+            gesture_end_kind(&anyhow::anyhow!("transient failure")),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_press_is_rejected_before_owner_side_effects() {
+        let active = HashMap::from([("runtime:default".to_owned(), ())]);
+        let error = ensure_press_slot_available(&active, "runtime:default").unwrap_err();
+        assert!(error.to_string().contains("already owns"));
+        assert!(ensure_press_slot_available(&active, "other-runtime:default").is_ok());
+    }
+
+    #[test]
+    fn stale_attempt_cannot_clear_a_replacement_reservation() {
+        let cursor_id = "unit-runtime:canceled-default".to_owned();
+        let canceled = Arc::new(AtomicBool::new(false));
+        pending_presses().lock().unwrap().insert(
+            cursor_id.clone(),
+            PendingAttempt {
+                attempt_id: 22,
+                canceled,
+            },
+        );
+        clear_pending_attempt(&cursor_id, 21);
+        assert_eq!(
+            pending_presses()
+                .lock()
+                .unwrap()
+                .get(&cursor_id)
+                .map(|attempt| attempt.attempt_id),
+            Some(22)
+        );
+        clear_pending_attempt(&cursor_id, 22);
+    }
 }

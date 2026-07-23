@@ -473,11 +473,29 @@ pub trait Tool: Send + Sync {
     async fn invoke(&self, args: Value) -> ToolResult;
 }
 
-struct RuntimeCleanup(Option<Box<dyn FnOnce() + Send + Sync>>);
+struct RuntimeCleanup(std::sync::Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>);
+
+impl RuntimeCleanup {
+    fn run(&self) {
+        let cleanup = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
+    }
+}
 
 impl Drop for RuntimeCleanup {
     fn drop(&mut self) {
-        if let Some(cleanup) = self.0.take() {
+        if let Some(cleanup) = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             cleanup();
         }
     }
@@ -724,7 +742,18 @@ impl ToolRegistry {
 
     pub fn retain_runtime_cleanup(&mut self, cleanup: impl FnOnce() + Send + Sync + 'static) {
         self.runtime_cleanups
-            .push(RuntimeCleanup(Some(Box::new(cleanup))));
+            .push(RuntimeCleanup(std::sync::Mutex::new(Some(Box::new(
+                cleanup,
+            )))));
+    }
+
+    /// Run runtime-owned resource cleanup now. Each callback is consumed at
+    /// most once; registry drop remains the fallback for callers that omit an
+    /// explicit shutdown.
+    pub fn run_runtime_cleanups(&self) {
+        for cleanup in &self.runtime_cleanups {
+            cleanup.run();
+        }
     }
 
     /// Register the four platform-independent recording/replay tools.
@@ -4793,5 +4822,21 @@ mod capability_tests {
             .any(|adapter| {
                 adapter["id"] == "browser_prepare.existing_profile" && adapter["state"] == "active"
             }));
+    }
+
+    #[test]
+    fn runtime_cleanup_runs_once_on_explicit_shutdown_or_drop() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_cleanup = calls.clone();
+        let mut registry = ToolRegistry::new();
+        registry.retain_runtime_cleanup(move || {
+            calls_for_cleanup.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        registry.run_runtime_cleanups();
+        registry.run_runtime_cleanups();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(registry);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

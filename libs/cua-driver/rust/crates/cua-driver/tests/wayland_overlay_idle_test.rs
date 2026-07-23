@@ -83,6 +83,37 @@ fn assert_idle_tick_bound(pid: u32, tid: u32, window: Duration, bound: u64) {
     );
 }
 
+fn wait_for_overlay_activity(pid: u32, tid: u32) {
+    let baseline = cpu_ticks(pid, tid);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        if cpu_ticks(pid, tid) > baseline {
+            return;
+        }
+    }
+    panic!("{OVERLAY_THREAD} never rendered after cursor activity");
+}
+
+fn wait_for_overlay_quiescence(pid: u32, tid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut quiet_windows = 0;
+    while Instant::now() < deadline {
+        let before = cpu_ticks(pid, tid);
+        thread::sleep(Duration::from_millis(250));
+        let delta = cpu_ticks(pid, tid).saturating_sub(before);
+        if delta == 0 {
+            quiet_windows += 1;
+            if quiet_windows == 4 {
+                return;
+            }
+        } else {
+            quiet_windows = 0;
+        }
+    }
+    panic!("{OVERLAY_THREAD} did not reach one continuous second of quiescence");
+}
+
 #[test]
 #[ignore]
 fn no_overlay_flag_never_starts_wayland_overlay_thread() {
@@ -140,7 +171,11 @@ fn wayland_overlay_quiesces_and_recovers_after_capture_and_cursor_activity() {
         serde_json::json!({"x": 500.0, "y": 360.0}),
     );
     let tid = wait_for_overlay_tid(pid);
-    thread::sleep(Duration::from_secs(2));
+    // Thread discovery precedes Wayland configure/command drain. Observe real
+    // rendering before accepting quiet windows, then require one continuous
+    // quiet second so a pre-configure block cannot false-pass readiness.
+    wait_for_overlay_activity(pid, tid);
+    wait_for_overlay_quiescence(pid, tid);
     assert_idle_tick_bound(pid, tid, Duration::from_secs(2), 1);
 
     call(
@@ -173,6 +208,6 @@ fn wayland_overlay_quiesces_and_recovers_after_capture_and_cursor_activity() {
         "re-enabled overlay did not resume rendering"
     );
 
-    thread::sleep(Duration::from_secs(2));
+    wait_for_overlay_quiescence(pid, tid);
     assert_idle_tick_bound(pid, tid, Duration::from_secs(2), 1);
 }

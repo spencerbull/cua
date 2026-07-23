@@ -165,7 +165,9 @@ fn with_target_foreground<T>(
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Some(window) =
+        if crate::wayland::hyprland::is_session() {
+            crate::wayland::hyprland::with_focused_window(pid, window_id, body)
+        } else if let Some(window) =
             crate::wayland::sway_ipc::window_for_id(window_id).filter(|window| window.pid == pid)
         {
             crate::wayland::sway_ipc::with_focused_container(window.id, body)
@@ -204,7 +206,7 @@ fn trusted_allow_click(pid: u32, window_id: u64) -> anyhow::Result<()> {
             })?;
         let (center_x, center_y) = exact_button_center(&tree.bounds, index)?;
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            crate::wayland::click_desktop(center_x, center_y, 1, 1)
+            crate::wayland::click_global_logical(center_x, center_y, 1, 1)
         } else {
             crate::input::send_click_xtest_desktop(center_x, center_y, 1, 1)
         }

@@ -211,6 +211,8 @@ impl DriverRuntime {
     pub(crate) async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _drained = self.lifecycle.write().await;
+        let registry = self.registry.clone();
+        let _ = tokio::task::spawn_blocking(move || registry.run_runtime_cleanups()).await;
         self.authorization_registry.revoke_all();
         let runtime_prefix = format!(
             "__cua_runtime_{}:",
@@ -422,6 +424,7 @@ fn activity_lifecycle_event(
 impl Drop for DriverRuntime {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.registry.run_runtime_cleanups();
         self.authorization_registry.revoke_all();
         let runtime_scope = self.compatibility_context.runtime_scope_key();
         let runtime_prefix = format!("__cua_runtime_{runtime_scope}:");
