@@ -2045,6 +2045,18 @@ fn authoritative_wayland_origin(pid: u32, xid: u64, title: Option<&str>) -> Opti
         return None;
     }
     crate::wayland::inject_accessibility_offset(pid)
+        .or_else(|| {
+            if !crate::wayland::hyprland::is_session() {
+                return None;
+            }
+            if crate::wayland::hyprland::is_surrogate_window_id(xid) {
+                crate::wayland::hyprland::window_origin(xid).ok()
+            } else {
+                crate::wayland::hyprland::window_origin_for_pid(pid)
+                    .ok()
+                    .flatten()
+            }
+        })
         .or_else(|| crate::wayland::sway_ipc::window_origin_for_pid(pid))
         .or_else(|| {
             (xid != 0)

@@ -233,7 +233,7 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
                     }
                     _ => {}
                 }
-            } else if !crate::wayland::shell_helper::available() {
+            } else if crate::wayland::overlay::should_use_native_overlay() {
                 let _ = crate::wayland::overlay::forward(&msg);
             }
         }
@@ -378,8 +378,20 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
+    let msg = OverlayMsg::Remove(key);
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(OverlayMsg::Remove(key));
+        if tx.try_send(msg.clone()).is_err() {
+            tracing::warn!("cursor state channel full while removing overlay");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland()
+        && !crate::wayland::shell_helper::available()
+        && crate::wayland::overlay::should_use_native_overlay()
+    {
+        if !crate::wayland::overlay::forward(&msg) {
+            tracing::warn!("Wayland overlay channel unavailable while removing cursor");
+        }
     }
 }
 
@@ -412,6 +424,22 @@ pub fn run_on_thread() {
     // thread spins up on demand without losing any commands (the
     // first send_command_for that triggers it spawns the thread,
     // future commands reuse it).
+
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland()
+        && (crate::wayland::shell_helper::available()
+            || crate::wayland::overlay::should_use_native_overlay())
+    {
+        // Wayland pixels are rendered by either the compositor helper or the
+        // layer-shell owner. Retain a lightweight state loop for cursor
+        // registries and arrival waiters without creating a duplicate XWayland
+        // window. Mixed sessions without either native renderer keep X11.
+        std::thread::Builder::new()
+            .name("cua-overlay-state".into())
+            .spawn(move || run_state_thread(rx))
+            .expect("spawn overlay state thread");
+        return;
+    }
 
     std::thread::Builder::new()
         .name("cua-overlay-x11".into())
@@ -616,6 +644,36 @@ fn wait_for_overlay_work(
 }
 
 // ── X11 thread ────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn run_state_thread(rx: std::sync::mpsc::Receiver<OverlayMsg>) {
+    let frame = Duration::from_millis(16);
+    let mut last_tick = Instant::now();
+    loop {
+        let now = Instant::now();
+        let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
+        last_tick = now;
+        let arrived = {
+            let mut guard = RENDER.lock().unwrap();
+            let Some(map) = guard.as_mut() else {
+                std::thread::sleep(frame);
+                continue;
+            };
+            while let Ok(msg) = rx.try_recv() {
+                if let Some(key) = apply_msg(map, msg) {
+                    map.last_active = Some(key);
+                }
+            }
+            tick_render_map(map, dt)
+        };
+        for key in &arrived {
+            arrival_fire(key);
+        }
+        if let Some(remaining) = frame.checked_sub(last_tick.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
