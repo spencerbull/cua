@@ -19,6 +19,7 @@
 //! Position command has arrived.
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Instant;
@@ -54,6 +55,24 @@ enum WlOverlayCmd {
 }
 
 static TX: OnceLock<Sender<WlOverlayCmd>> = OnceLock::new();
+
+/// Select native layer-shell rendering when no X11 fallback exists, or when
+/// explicitly requested in a mixed Wayland/XWayland session. This prevents
+/// duplicate overlays while preserving the mature X11 renderer by default.
+pub fn should_use_native_overlay() -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return false;
+    }
+    if std::env::var_os("DISPLAY").is_none() {
+        return true;
+    }
+    std::env::var("CUA_DRIVER_RS_ENABLE_WAYLAND_OVERLAY")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+}
 
 fn tx() -> Option<&'static Sender<WlOverlayCmd>> {
     TX.get()
@@ -92,17 +111,16 @@ pub fn forward(msg: &OverlayMsg) -> bool {
     match msg {
         OverlayMsg::Remove(k) => {
             let _ = k;
-            let _ = tx.try_send(WlOverlayCmd::Remove);
-            true
+            tx.try_send(WlOverlayCmd::Remove).is_ok()
         }
         OverlayMsg::Cmd(kc) => {
             if matches!(&kc.cmd, OverlayCommand::ShowFocusRect(_)) {
                 return false;
             }
-            let _ = tx.try_send(WlOverlayCmd::Cmd {
+            tx.try_send(WlOverlayCmd::Cmd {
                 cmd: kc.cmd.clone(),
-            });
-            true
+            })
+            .is_ok()
         }
     }
 }
@@ -146,6 +164,14 @@ struct OverlayState {
 // requires for State types apply to the struct as a whole, hence the
 // explicit assertion.
 unsafe impl Send for OverlayState {}
+
+impl Drop for OverlayState {
+    fn drop(&mut self) {
+        for (_, (ptr, size, fd)) in std::mem::take(&mut self.pending_buffers) {
+            super::cleanup_mmap(ptr, size, fd);
+        }
+    }
+}
 
 impl Default for OverlayState {
     fn default() -> Self {
@@ -256,6 +282,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
 
     let frame_dur = std::time::Duration::from_millis(16);
     let mut last_tick = Instant::now();
+    let mut redraw_pending = false;
     loop {
         // Drain all pending commands without blocking.
         let mut shutdown = false;
@@ -291,12 +318,14 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                     // path handles. `move_to_snap_sentinel` / `click_pulse
                     // _sentinel_only` are both `false` here — same as X11.
                     let _ = state.core.apply_command_base(cmd, false, false);
+                    redraw_pending = true;
                 }
                 Ok(WlOverlayCmd::Remove) => {
                     // Single-cursor overlay: removing the active cursor
                     // hides it. Multi-cursor wlroots support can layer on
                     // top of this in a follow-up if needed.
                     state.core.visible = false;
+                    redraw_pending = true;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -313,9 +342,36 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         let now = Instant::now();
         let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
         last_tick = now;
+        let render_signature = |core: &RenderStateCore| {
+            (
+                (core.pos.0 * 4.0).round() as i64,
+                (core.pos.1 * 4.0).round() as i64,
+                (core.heading * 1024.0).round() as i64,
+                core.click_t.map(|value| (value * 255.0).round() as i32),
+                (core.idle_alpha * 255.0).round() as i32,
+            )
+        };
+        let before_tick = render_signature(&state.core);
         state.core.tick_motion(dt);
-        if state.configured {
+        redraw_pending |= before_tick != render_signature(&state.core);
+        // A buffer cannot be reused until wl_buffer.release. Keep only one
+        // compositor-owned mmap in flight and process releases every tick.
+        if state.configured && state.pending_buffers.is_empty() && redraw_pending {
             redraw(&mut state, &shm, &qh)?;
+            redraw_pending = false;
+        }
+        queue.flush()?;
+        if let Some(guard) = queue.prepare_read() {
+            let mut poll_fd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll_fd points to one initialized pollfd for this call.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+            if ready > 0 && poll_fd.revents & libc::POLLIN != 0 {
+                guard.read()?;
+            }
         }
         queue.dispatch_pending(&mut state)?;
 

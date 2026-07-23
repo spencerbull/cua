@@ -1025,6 +1025,11 @@ fn resolve_element_local_coords(
     };
 
     if crate::wayland::wayland_input_enabled() {
+        if crate::wayland::hyprland::is_session() {
+            let (local_x, local_y) =
+                crate::wayland::hyprland::screen_to_window_capture(xid, screen_cx, screen_cy)?;
+            return Ok((xid, local_x, local_y));
+        }
         let (window_x, window_y, window_width, window_height) =
             crate::wayland::window_geometry(xid)
                 .ok_or_else(|| anyhow::anyhow!("No Wayland geometry for window {xid}"))?;
@@ -1057,6 +1062,11 @@ fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        let (screen_x, screen_y) =
+            crate::wayland::hyprland::window_capture_to_screen(xid, x as i32, y as i32)?;
+        return Ok((f64::from(screen_x), f64::from(screen_y)));
+    }
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
     use x11rb::rust_connection::RustConnection;
@@ -1498,6 +1508,27 @@ fn mouse_hold_json(cursor_id: &str, hold: Option<&MouseHoldState>) -> Value {
             "y": Value::Null,
         }),
     }
+}
+
+fn reconcile_ended_persistent_hold(
+    state: &ToolState,
+    cursor_id: &str,
+    error: &anyhow::Error,
+) -> Option<crate::wayland::persistent_vptr::PersistentPointerEndKind> {
+    let kind = crate::wayland::persistent_vptr::gesture_end_kind(error)?;
+    state.mouse_hold.lock().unwrap().remove(cursor_id);
+    crate::overlay::send_command_for(
+        cursor_id.to_owned(),
+        cursor_overlay::OverlayCommand::SetPressed(false),
+    );
+    Some(kind)
+}
+
+fn ended_hold_warning_json(cursor_id: &str, status: &str, warning: &str) -> Value {
+    let mut structured = mouse_hold_json(cursor_id, None);
+    structured["cleanup_status"] = json!(status);
+    structured["warning"] = json!(warning);
+    structured
 }
 
 fn held_target_mismatch(
@@ -5070,8 +5101,22 @@ impl Tool for MouseDragTool {
                 ))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
             }
-            Err(e) => ToolResult::error(e.to_string())
-                .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
+            Err(e) => {
+                let ended = reconcile_ended_persistent_hold(&self.state, &cursor_id, &e);
+                let structured = match ended {
+                    Some(crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled) => {
+                        ended_hold_warning_json(&cursor_id, "canceled", &e.to_string())
+                    }
+                    Some(
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::CleanupFailed,
+                    ) => ended_hold_warning_json(&cursor_id, "failed", &e.to_string()),
+                    Some(
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent,
+                    ) => mouse_hold_json(&cursor_id, None),
+                    None => mouse_hold_json(&cursor_id, Some(&hold)),
+                };
+                ToolResult::error(e.to_string()).with_structured(structured)
+            }
         }
     }
 }
@@ -5192,8 +5237,38 @@ impl Tool for MouseButtonUpTool {
                 ))
                 .with_structured(cleared)
             }
-            Ok(Err(e)) => ToolResult::error(e.to_string())
-                .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
+            Ok(Err(e)) => match reconcile_ended_persistent_hold(&self.state, &cursor_id, &e) {
+                Some(
+                    crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent,
+                ) => ToolResult::text(format!(
+                    "Cursor '{cursor_id}' was already released; local held-button state was cleared."
+                ))
+                .with_structured(mouse_hold_json(&cursor_id, None)),
+                Some(kind @ (crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled
+                    | crate::wayland::persistent_vptr::PersistentPointerEndKind::CleanupFailed)) => {
+                    let warning = e.to_string();
+                    let status = match kind {
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled => {
+                            "canceled"
+                        }
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::CleanupFailed => {
+                            "failed"
+                        }
+                        crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent => {
+                            unreachable!()
+                        }
+                    };
+                    let summary = if status == "failed" {
+                        "held-button cleanup failed after the gesture ended"
+                    } else {
+                        "held-button gesture was canceled before release"
+                    };
+                    ToolResult::error(format!("Cursor '{cursor_id}' {summary}: {warning}"))
+                    .with_structured(ended_hold_warning_json(&cursor_id, status, &warning))
+                }
+                None => ToolResult::error(e.to_string())
+                    .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
+            },
             Err(e) => ToolResult::error(format!("Task error: {e}"))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),
         }
@@ -5565,19 +5640,36 @@ impl Tool for GetScreenSizeTool {
             return result;
         }
         let result = tokio::task::spawn_blocking(|| {
+            if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                return crate::wayland::hyprland::screen_size();
+            }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption).  Wayland/HiDPI X11 callers should query
             // `xrandr --query` for true scale.
             let (w, h) = x11_screen_size()?;
-            Ok::<(u32, u32, f64), anyhow::Error>((w, h, 1.0))
+            Ok::<(u32, u32, f64, i32, i32, String), anyhow::Error>((w, h, 1.0, 0, 0, String::new()))
         })
         .await;
         match result {
             // Matches Swift text format 1:1.
-            Ok(Ok((w, h, scale))) => {
+            Ok(Ok((w, h, scale, origin_x, origin_y, output_name))) => {
+                let hyprland =
+                    crate::wayland::is_wayland() && crate::wayland::hyprland::is_session();
                 ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
-                    .with_structured(json!({ "width": w, "height": h, "scale_factor": scale }))
+                    .with_structured(json!({
+                        "width": w,
+                        "height": h,
+                        "scale_factor": scale,
+                        "origin_x": origin_x,
+                        "origin_y": origin_y,
+                        "output_name": output_name,
+                        "coordinate_space": if hyprland {
+                            "focused_output_logical"
+                        } else {
+                            "screen_physical"
+                        },
+                    }))
             }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -5657,6 +5749,22 @@ impl Tool for GetDesktopStateTool {
             // abort the tool even though the screenshot already succeeded.
             // Only fall back to the X11 root-window geometry off Wayland, so
             // the X11 / XWayland path is unchanged. See #2017 / Sway testing.
+            let hypr_space = if crate::wayland::is_wayland()
+                && crate::wayland::hyprland::is_session()
+            {
+                Some(crate::wayland::hyprland::desktop_capture_space()?)
+            } else {
+                None
+            };
+            if let Some(space) = hypr_space {
+                if space.width.abs_diff(shot_w) > 1 || space.height.abs_diff(shot_h) > 1 {
+                    anyhow::bail!(
+                        "Hyprland desktop capture geometry mismatch: grim returned {shot_w}x{shot_h}, expected {}x{} from enabled-output layout",
+                        space.width,
+                        space.height
+                    );
+                }
+            }
             let (screen_w, screen_h) = if crate::wayland::is_wayland() {
                 (shot_w, shot_h)
             } else {
@@ -5675,12 +5783,20 @@ impl Tool for GetDesktopStateTool {
             } else {
                 Some(B64.encode(&png))
             };
-            Ok((b64, shot_w, shot_h, screen_w, screen_h, written))
+            Ok((
+                b64,
+                shot_w,
+                shot_h,
+                screen_w,
+                screen_h,
+                written,
+                hypr_space,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written))) => {
+            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written, hypr_space))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({
                     "platform": "linux",
@@ -5692,6 +5808,12 @@ impl Tool for GetDesktopStateTool {
                     "scale_factor": 1.0,
                     "screenshot_mime_type": "image/png",
                 });
+                if let Some(space) = hypr_space {
+                    structured["coordinate_space"] = json!("hyprland_desktop_capture");
+                    structured["origin_x"] = json!(space.origin_x);
+                    structured["origin_y"] = json!(space.origin_y);
+                    structured["capture_scale"] = json!(space.scale);
+                }
                 if let Some(b64) = b64_opt {
                     content.push(cua_driver_core::protocol::Content::image_png(b64));
                 }
@@ -5749,6 +5871,23 @@ impl Tool for GetCursorPositionTool {
         // global cursor position. Fall back to the synthetic registry that
         // records every `motion_absolute` this process emits.
         if crate::wayland::is_wayland() {
+            if crate::wayland::hyprland::is_session() {
+                let result =
+                    tokio::task::spawn_blocking(crate::wayland::hyprland::cursor_position).await;
+                return match result {
+                    Ok(Ok((x, y))) => {
+                        ToolResult::text(format!("✅ Cursor at ({x}, {y}) (Hyprland compositor)"))
+                            .with_structured(json!({
+                                "x": x,
+                                "y": y,
+                                "source": "hyprland",
+                                "coordinate_space": "global_logical",
+                            }))
+                    }
+                    Ok(Err(error)) => ToolResult::error(error.to_string()),
+                    Err(error) => ToolResult::error(format!("Task error: {error}")),
+                };
+            }
             return match crate::wayland::last_synth_cursor_pos() {
                 Some((x, y)) => ToolResult::text(
                     format!("✅ Cursor at ({x}, {y}) (synthetic — last move_cursor in this process)")
@@ -5811,21 +5950,41 @@ impl Tool for MoveCursorTool {
             let xi = x.round() as i32;
             let yi = y.round() as i32;
             let result = if crate::wayland::wayland_input_enabled() {
+                let hyprland = crate::wayland::hyprland::is_session();
                 tokio::task::spawn_blocking(move || {
-                    crate::wayland::move_cursor_absolute(None, xi, yi)
+                    let (screen_x, screen_y) = if hyprland {
+                        crate::wayland::hyprland::desktop_capture_to_screen(xi, yi)?
+                    } else {
+                        (xi, yi)
+                    };
+                    crate::wayland::move_cursor_absolute(None, screen_x, screen_y)?;
+                    Ok::<_, anyhow::Error>((screen_x, screen_y))
                 })
                 .await
             } else {
-                tokio::task::spawn_blocking(move || crate::input::send_move_xtest_desktop(xi, yi))
-                    .await
+                tokio::task::spawn_blocking(move || {
+                    crate::input::send_move_xtest_desktop(xi, yi)?;
+                    Ok::<_, anyhow::Error>((xi, yi))
+                })
+                .await
             };
             return match result {
-                Ok(Ok(())) => {
-                    ToolResult::text(format!("Moved the real desktop pointer to ({xi}, {yi})."))
-                        .with_structured(
-                            json!({"scope":"desktop","x":xi,"y":yi,"effect":"unverifiable"}),
-                        )
-                }
+                Ok(Ok((screen_x, screen_y))) => ToolResult::text(format!(
+                    "Moved the real desktop pointer to ({screen_x}, {screen_y})."
+                ))
+                .with_structured(json!({
+                    "scope":"desktop",
+                    "x":screen_x,
+                    "y":screen_y,
+                    "capture_x":xi,
+                    "capture_y":yi,
+                    "coordinate_space": if crate::wayland::hyprland::is_session() {
+                        "hyprland_global_logical"
+                    } else {
+                        "desktop_capture"
+                    },
+                    "effect":"unverifiable"
+                })),
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
@@ -7187,5 +7346,49 @@ mod browser_launch_guard_tests {
         assert!(!contains_remote_debugging_flag(
             "--user-data-dir=/tmp/profile"
         ));
+    }
+}
+
+#[cfg(test)]
+mod persistent_hold_reconciliation_tests {
+    use super::{reconcile_ended_persistent_hold, MouseHoldState, ToolState};
+
+    #[test]
+    fn canceled_persistent_gesture_clears_tool_hold_state() {
+        let state = ToolState::new();
+        state.mouse_hold.lock().unwrap().insert(
+            "cursor-a".to_owned(),
+            MouseHoldState {
+                pid: 7,
+                xid: 9,
+                button: 1,
+                x: 10.0,
+                y: 20.0,
+            },
+        );
+        let error = anyhow::Error::new(
+            crate::wayland::persistent_vptr::PersistentPointerError::GestureCanceled(
+                "cross-output gesture canceled".to_owned(),
+            ),
+        );
+        assert_eq!(
+            reconcile_ended_persistent_hold(&state, "cursor-a", &error),
+            Some(crate::wayland::persistent_vptr::PersistentPointerEndKind::Canceled)
+        );
+        assert!(!state.mouse_hold.lock().unwrap().contains_key("cursor-a"));
+    }
+
+    #[test]
+    fn already_absent_cleanup_is_classified_as_benign() {
+        let state = ToolState::new();
+        let error = anyhow::Error::new(
+            crate::wayland::persistent_vptr::PersistentPointerError::AlreadyAbsent(
+                "already gone".to_owned(),
+            ),
+        );
+        assert_eq!(
+            reconcile_ended_persistent_hold(&state, "cursor-a", &error),
+            Some(crate::wayland::persistent_vptr::PersistentPointerEndKind::AlreadyAbsent)
+        );
     }
 }

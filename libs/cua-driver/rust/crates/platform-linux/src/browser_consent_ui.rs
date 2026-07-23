@@ -165,7 +165,9 @@ fn with_target_foreground<T>(
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Some(window) =
+        if crate::wayland::hyprland::is_session() {
+            crate::wayland::hyprland::with_focused_window(pid, window_id, body)
+        } else if let Some(window) =
             crate::wayland::sway_ipc::window_for_id(window_id).filter(|window| window.pid == pid)
         {
             crate::wayland::sway_ipc::with_focused_container(window.id, body)
