@@ -830,13 +830,10 @@ typed browser tools yet.
   materialized yet. Re-call `list_windows({pid: N})` after 500ms;
   for chronic cases, key off the app name in `list_windows({})`
   output.
-- **JPEG screenshot has more compression than expected** — default
-  quality on the MCP screenshot compat path is 85; for raw
-  `get_window_state` returns a screenshot by default; pass
-  `include_screenshot:false` only for a deliberate tree-only call.
-  Pass `{format: "jpeg", quality: 70}` to opt into compressed
-  screenshots. The `max_image_dimension` config (default 2048)
-  downscales via Lanczos3 before encoding.
+- **Need a tree-only state read** — `get_window_state` returns a PNG
+  screenshot by default. Pass `include_screenshot:false` for a deliberate
+  tree-only performance path. The removed screenshot compatibility tool and
+  its `format` / `quality` inputs are not accepted by v0.19.3.
 
 ## Diagnostics
 

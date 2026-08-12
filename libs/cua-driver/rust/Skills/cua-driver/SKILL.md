@@ -689,10 +689,10 @@ The response carries:
 
 ```bash
 # write to file — stdout stays readable (AX/UIA tree / summary only, no base64)
-cua-driver-local get_window_state '{"session":"my-named-run","pid":N,"window_id":W,"screenshot_out_file":"/tmp/shot.jpg"}'
+cua-driver-local get_window_state '{"session":"my-named-run","pid":N,"window_id":W,"screenshot_out_file":"/tmp/shot.png"}'
 
 # CLI --screenshot-out-file flag is equivalent
-cua-driver-local get_window_state '{"session":"my-named-run","pid":N,"window_id":W}' --screenshot-out-file /tmp/shot.jpg
+cua-driver-local get_window_state '{"session":"my-named-run","pid":N,"window_id":W}' --screenshot-out-file /tmp/shot.png
 ```
 
 Pass `screenshot_out_file` when using `get_window_state` via CLI or
