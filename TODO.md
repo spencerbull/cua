@@ -59,13 +59,25 @@ named GUI-control session across pointer and keyboard actions.
 - [x] Streams integrated and independently reviewed; two documentation-only
   screenshot contract findings were fixed in `04f8fa0b6`, then re-reviewed
   with no remaining blockers.
-- [ ] Local install and live Hyprland verification complete.
+- [x] Native Wayland overlay now owns one surface per output
+  (`9ce93db29`), preserves independent named-session cursors (`61fa09d87`),
+  and initializes every configured surface without blocking screencopy
+  (`13e48ae27`). Each fix passed a separate independent review.
+- [x] Local release install, source provenance, service isolation, exact
+  Codex/Claude skill links, three-output layer creation, live Hyprland capture,
+  session cleanup, and zero-tick idle behavior verified.
+- [ ] Final visible pointer/click/keyboard postcondition after the secure
+  Omarchy session is normally unlocked. The lock became secure during the live
+  run; credentials were not requested or entered, and the test app/session were
+  cleaned up.
 - [ ] Final commits pushed.
 
 ## Open questions and checkpoints
 
-- None requiring user input. Stop if either stream requires changing the stable
-  release channel or the v0.19.3 public action schema.
+- Resume the final visible pointer/click/keyboard check after Omarchy IPC reports
+  `sessionLocked:false`. Do not attempt to unlock the secure surface.
+- Stop if either stream requires changing the stable release channel or the
+  v0.19.3 public action schema.
 
 ## Evidence
 
@@ -73,14 +85,29 @@ named GUI-control session across pointer and keyboard actions.
   `cargo check -p cua-driver-core -p cua-driver-sdk -p platform-linux
   --all-targets` pass.
 - `cursor-overlay`: 44 passed.
-- `platform-linux --lib`: 289 passed, 4 environment-dependent tests ignored.
+- `platform-linux --lib`: 301 passed, 4 environment-dependent tests ignored.
+- Native Wayland overlay: 18 focused tests pass, covering three-monitor logical
+  routing, cross-output clearing, independent session ownership, ended-session
+  tombstones, hotplug/reconfigure initialization, and idle scheduling.
 - Skill installer/docs contract: 17 passed.
 - Cursor-event contract: 2 passed; session lifecycle: 3 passed.
 - Permission policy: 10 passed; daemon-required: 10 passed; prompt
   authorization: 1 passed; session capture scope: 2 passed; private worker: 4
   passed, 1 subprocess-only probe ignored.
 - Optimized `cargo build -p cua-driver --release` passes.
-- Independent reviewer found no remaining blockers after `04f8fa0b6`.
+- Independent reviewer found no source-level blockers after `13e48ae27`.
 - The generic skill validator stops only on this product pack's intentional
   `version:` frontmatter extension; repository contract tests validate the
   versioned pack and live schemas.
+- Installed `cua-driver-local get_config` reports version `0.19.3` and exact
+  source SHA `13e48ae27df3194042c52a4b3588df727dd73624`; stable `cua-driver`
+  remains `0.7.1`.
+- The user service is enabled and active with `serve --idle-hide-ms 0`.
+  Hyprland exposes correctly sized `cua-agent-cursor` layers on eDP-1, DP-1,
+  and DP-2; the stable owner thread used zero CPU ticks over a three-second
+  idle window.
+- With all overlay layers active, direct `grim` and CUA `get_window_state`
+  both completed. This specifically regresses the pre-fix hang caused by
+  configured layer surfaces that lacked their first committed buffer.
+- The isolated Sway runtime test could not run because `sway` is not installed;
+  no package installation was added to this task.
