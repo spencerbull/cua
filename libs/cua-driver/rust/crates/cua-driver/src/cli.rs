@@ -251,6 +251,22 @@ fn positional_args(args: &[String]) -> Vec<&str> {
     positionals
 }
 
+fn skills_command_from_args(args: &[String]) -> Command {
+    let index = args
+        .iter()
+        .position(|value| value == "skills")
+        .expect("skills positional is present");
+    let tail = &args[index + 1..];
+    let has_subcommand = tail.first().is_some_and(|value| !value.starts_with('-'));
+    let subcommand = if has_subcommand {
+        tail[0].clone()
+    } else {
+        "status".to_owned()
+    };
+    let flags = tail[usize::from(has_subcommand)..].to_vec();
+    Command::Skills { subcommand, flags }
+}
+
 fn finite_command_name_from_args(args: &[String]) -> Option<&'static str> {
     if args
         .iter()
@@ -849,20 +865,10 @@ pub fn parse_command() -> Command {
             Command::Autostart { subcommand }
         }
         Some("skills") => {
-            // Skills subcommand. Default is `status` so plain `cua-driver
-            // skills` is a read-only probe — won't ever modify user state.
-            let subcommand = pos.next().unwrap_or("status").to_string();
-            // Pass through any other flags / args after the subcommand for
-            // the verb's own parsing (e.g. `--force`, `--from main`,
-            // `--agent claude-code`, `--local`, `--all`). Collect from `pos`
-            // and dotted long-form flags from the raw args too.
-            let mut flags: Vec<String> = pos.map(str::to_owned).collect();
-            for a in &args {
-                if a.starts_with("--") && !flags.contains(a) {
-                    flags.push(a.clone());
-                }
-            }
-            Command::Skills { subcommand, flags }
+            // Preserve the raw tail so value-bearing repeatable options such
+            // as `--agent codex --agent claude` retain their values and order.
+            // Plain `skills` still defaults to the read-only status command.
+            skills_command_from_args(&args)
         }
         Some("cursor-theme") => {
             let index = args
@@ -3953,6 +3959,31 @@ mod tests {
             finite_operation_from_args(&args(&["recording", "private-value"])),
             "other"
         );
+    }
+
+    #[test]
+    fn skills_command_preserves_repeatable_agent_values_and_default_status() {
+        let command = skills_command_from_args(&args(&[
+            "skills", "install", "--local", "--agent", "codex", "--agent", "claude",
+        ]));
+        match command {
+            Command::Skills { subcommand, flags } => {
+                assert_eq!(subcommand, "install");
+                assert_eq!(
+                    flags,
+                    args(&["--local", "--agent", "codex", "--agent", "claude"])
+                );
+            }
+            _ => panic!("expected skills command"),
+        }
+
+        match skills_command_from_args(&args(&["skills", "--local", "--agent=codex"])) {
+            Command::Skills { subcommand, flags } => {
+                assert_eq!(subcommand, "status");
+                assert_eq!(flags, args(&["--local", "--agent=codex"]));
+            }
+            _ => panic!("expected skills status command"),
+        }
     }
 
     #[test]
