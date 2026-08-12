@@ -6,7 +6,8 @@
 //! `irm | iex` / `curl | sh` one-liner that the user might be running
 //! just to try the binary. This verb is the opt-in path: fetch the
 //! versioned skill pack from a matching GitHub release and symlink it
-//! into each detected agent's skills dir.
+//! into selected agents' skills dirs. Source builds can instead link the
+//! checkout-staged pack with `--local --agent <name>`.
 //!
 //! ## Subcommands
 //!
@@ -32,10 +33,12 @@
 //! content to the binary release so an agent loading the doc knows
 //! every example matches the daemon it'll talk to.
 //!
-//! `--from <tag>` lets the user pin a different release tag.
 //! `--from main` fetches the latest from the `main` branch via the
 //! `Skills/cua-driver/` directory (one HTTP call per file — used
 //! for bleeding-edge dev validation; not the default).
+//! `--local` never performs a network request. It links the pack staged by
+//! `scripts/install-local.sh` under
+//! `<HomeDir>/packages/current/Skills/cua-driver`.
 //!
 //! ## Agent detection
 //!
@@ -50,16 +53,14 @@
 //! - Antigravity: `~/.gemini/skills/` — shared between Antigravity CLI
 //!   (`agy`) and Antigravity IDE; same dir Google Gemini CLI used before the
 //!   May-2026 transition, so existing installs migrate forward unchanged.
-//! - Hermes: `~/.hermes/skills/` — NousResearch/hermes-agent. The user-level
-//!   skill space Hermes resolves at agent load time (separate from the
-//!   repo-bundled `hermes-agent/skills/` tree, which is read-only and
-//!   version-controlled). Hermes' own `computer-use` skill teaches its wrapper
-//!   vocabulary; the cua-driver pack provides the platform deep dives.
-//!
+//! - Hermes: `~/.hermes/skills/` — supported by the generic release-pack
+//!   installer. A selective `--agent` invocation never touches it unless it is
+//!   explicitly requested.
 //! Only acts on a given agent when its parent skills dir already
-//! exists (i.e. the agent itself is installed). Never clobbers an
-//! existing `<agent_skills>/cua-driver` link — preserves dev users'
-//! hand-rolled symlinks.
+//! exists (i.e. the agent itself is installed). `--agent` is repeatable and
+//! limits all link changes to the requested agents. Existing real directories
+//! and unrelated/user-managed symlinks are always preserved. A link is
+//! retargeted only when its current target is a known Cua-managed pack.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -131,6 +132,22 @@ fn local_skill_dir() -> Result<PathBuf> {
     Ok(home.join("skills").join(SKILL_PACK_NAME))
 }
 
+/// Pack copied directly from the checkout by `scripts/install-local.sh`.
+///
+/// The stable `packages/current` indirection is intentional: a later source
+/// reinstall atomically advances `current`, so agent links do not need to be
+/// rewritten for every build.
+fn local_bundled_skill_dir() -> Result<PathBuf> {
+    let home = std::env::var("CUA_DRIVER_LOCAL_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(home_dir()?);
+    Ok(home
+        .join("packages")
+        .join("current")
+        .join("Skills")
+        .join(SKILL_PACK_NAME))
+}
+
 /// `<HomeDir>` resolved from the same env override `serve.rs` uses,
 /// falling back to platform conventions.
 fn home_dir() -> Result<PathBuf> {
@@ -171,6 +188,7 @@ fn legacy_home_dir() -> Option<PathBuf> {
 
 #[derive(Debug, Clone, Copy)]
 struct Agent {
+    key: &'static str,
     label: &'static str,
     /// User-relative parent skills dir, expanded at runtime per OS.
     parent: AgentParent,
@@ -194,28 +212,34 @@ enum AgentParent {
 
 const AGENTS: &[Agent] = &[
     Agent {
+        key: "claude",
         label: "Claude Code",
         parent: AgentParent::Home(".claude/skills"),
     },
     Agent {
+        key: "codex",
         label: "Codex",
         parent: AgentParent::Home(".agents/skills"),
     },
     Agent {
+        key: "prime",
         label: "Prime Agent",
         parent: AgentParent::Home(".prime/agent/skills"),
     },
     Agent {
+        key: "openclaw",
         label: "OpenClaw",
         parent: AgentParent::Home(".openclaw/skills"),
     },
     #[cfg(windows)]
     Agent {
+        key: "opencode",
         label: "OpenCode",
         parent: AgentParent::AppData("opencode/skills"),
     },
     #[cfg(not(windows))]
     Agent {
+        key: "opencode",
         label: "OpenCode",
         parent: AgentParent::Home(".config/opencode/skills"),
     },
@@ -223,18 +247,12 @@ const AGENTS: &[Agent] = &[
     // (the same path Gemini CLI used pre-May-2026). Registering the
     // single shared path means both surfaces pick up the same symlink.
     Agent {
+        key: "antigravity",
         label: "Antigravity",
         parent: AgentParent::Home(".gemini/skills"),
     },
-    // Hermes (NousResearch/hermes-agent) resolves user skills from
-    // `~/.hermes/skills/` at agent load time — the same directory its
-    // `/skills install …` slash command and `hermes skills install`
-    // CLI write to. Hermes' bundled `skills/computer-use/SKILL.md`
-    // teaches the Hermes `computer_use` action vocabulary; the
-    // cua-driver pack symlinked here adds the platform-specific deep
-    // dives (MACOS.md / WINDOWS.md / LINUX.md / RECORDING.md /
-    // BROWSER.md) that Hermes deliberately doesn't clone.
     Agent {
+        key: "hermes",
         label: "Hermes",
         parent: AgentParent::Home(".hermes/skills"),
     },
@@ -265,18 +283,132 @@ impl Agent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillSource {
+    Release,
+    Main,
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillOptions {
+    source: SkillSource,
+    force: bool,
+    all_platforms: bool,
+    agent_keys: Vec<String>,
+}
+
+impl SkillOptions {
+    fn selected_agents(&self) -> Vec<Agent> {
+        if self.agent_keys.is_empty() {
+            return AGENTS.to_vec();
+        }
+        AGENTS
+            .iter()
+            .filter(|agent| self.agent_keys.iter().any(|key| key == agent.key))
+            .copied()
+            .collect()
+    }
+}
+
+fn parse_skill_options(flags: &[String]) -> Result<SkillOptions> {
+    let mut source = SkillSource::Release;
+    let mut force = false;
+    let mut all_platforms = false;
+    let mut agent_keys = Vec::new();
+    let mut index = 0;
+
+    while index < flags.len() {
+        let flag = &flags[index];
+        match flag.as_str() {
+            "--local" => {
+                if source != SkillSource::Release {
+                    bail!("--local cannot be combined with --from main");
+                }
+                source = SkillSource::Local;
+            }
+            "--from" => {
+                let value = flags
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--from requires the value 'main'"))?;
+                if value != "main" {
+                    bail!("unsupported --from value '{value}'; expected 'main'");
+                }
+                if source == SkillSource::Local {
+                    bail!("--from main cannot be combined with --local");
+                }
+                source = SkillSource::Main;
+                index += 1;
+            }
+            "--from=main" => {
+                if source == SkillSource::Local {
+                    bail!("--from main cannot be combined with --local");
+                }
+                source = SkillSource::Main;
+            }
+            "--force" => force = true,
+            "--all-platforms" => all_platforms = true,
+            "--agent" => {
+                let value = flags
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("--agent requires a name"))?;
+                push_agent_key(&mut agent_keys, value)?;
+                index += 1;
+            }
+            _ if flag.starts_with("--agent=") => {
+                push_agent_key(&mut agent_keys, &flag["--agent=".len()..])?;
+            }
+            _ => bail!("unknown skills option '{flag}'"),
+        }
+        index += 1;
+    }
+
+    Ok(SkillOptions {
+        source,
+        force,
+        all_platforms,
+        agent_keys,
+    })
+}
+
+fn push_agent_key(selected: &mut Vec<String>, value: &str) -> Result<()> {
+    let key = value.trim().to_ascii_lowercase();
+    if !AGENTS.iter().any(|agent| agent.key == key) {
+        let supported = AGENTS
+            .iter()
+            .map(|agent| agent.key)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("unknown agent '{value}'; expected one of: {supported}");
+    }
+    if !selected.contains(&key) {
+        selected.push(key);
+    }
+    Ok(())
+}
+
+fn validate_local_selection(options: &SkillOptions) -> Result<()> {
+    if options.source == SkillSource::Local && options.agent_keys.is_empty() {
+        bail!(
+            "--local requires at least one explicit --agent (for example: --agent codex --agent claude)"
+        );
+    }
+    Ok(())
+}
+
 // ── Public dispatcher ─────────────────────────────────────────────────────
 
 pub fn run(subcommand: &str, flags: &[String]) {
+    let binary = crate::bundle::cli_name();
     let result = match subcommand {
         "install" => install(flags, false),
         "update" => install(flags, true),
         "uninstall" => uninstall(flags),
-        "status" => status(),
+        "status" => status(flags),
         "path" => print_path(),
         other => {
             eprintln!("Unknown skills subcommand: {other:?}");
-            eprintln!("Usage: cua-driver skills {{install|update|uninstall|status|path}}");
+            eprintln!("Usage: {binary} skills {{install|update|uninstall|status|path}}");
             std::process::exit(64);
         }
     };
@@ -286,7 +418,7 @@ pub fn run(subcommand: &str, flags: &[String]) {
             // `anyhow::Error`'s default Display only prints the outermost
             // context. Use alternate Display so failures include the source
             // URL and the underlying HTTP, extraction, or filesystem error.
-            eprintln!("cua-driver skills {subcommand}: {e:#}");
+            eprintln!("{binary} skills {subcommand}: {e:#}");
             std::process::exit(1);
         }
     }
@@ -295,48 +427,75 @@ pub fn run(subcommand: &str, flags: &[String]) {
 // ── install / update ──────────────────────────────────────────────────────
 
 fn install(flags: &[String], force: bool) -> Result<()> {
-    let from_main = flags.iter().any(|f| f == "--from=main")
-        || (flags.iter().any(|f| f == "--from")
-            && flags
-                .iter()
-                .zip(flags.iter().skip(1))
-                .any(|(a, b)| a == "--from" && b == "main"));
-    let force = force || flags.iter().any(|f| f == "--force");
-    // `--all-platforms` opts INTO keeping LINUX.md / MACOS.md / WINDOWS.md
-    // for every host. Default is host-only — only the matching platform's
-    // doc is kept, the other two are skipped during fetch.
-    let all_platforms = flags.iter().any(|f| f == "--all-platforms");
+    let options = parse_skill_options(flags)?;
+    validate_local_selection(&options)?;
+    let force = force || options.force;
+    let selected_agents = options.selected_agents();
 
-    // Sweep the legacy `cua-driver-rs`-named pack out FIRST so the
-    // post-install state has exactly one skill pack at the new name.
-    // Done before fetch so a fresh install on a previously-installed
-    // machine doesn't leave orphan links pointing at a stale local dir.
-    sweep_legacy_skill_pack();
+    let local = match options.source {
+        SkillSource::Local => {
+            let staged = local_bundled_skill_dir()?;
+            if !staged.join("SKILL.md").is_file() {
+                bail!(
+                    "local skill pack is not staged at {}; run libs/cua-driver/scripts/install-local.sh --release first",
+                    staged.display()
+                );
+            }
+            println!(
+                "✅ Using checkout-staged skill pack at {}",
+                staged.display()
+            );
+            staged
+        }
+        SkillSource::Release | SkillSource::Main => {
+            let local = local_skill_dir()?;
+            let already_present = local.join("SKILL.md").exists();
+            if !already_present || force {
+                fetch_into(
+                    &local,
+                    options.source == SkillSource::Main,
+                    options.all_platforms,
+                )
+                .with_context(|| format!("failed to fetch skill pack to {}", local.display()))?;
+                println!("✅ Skill pack at {}", local.display());
+            } else {
+                println!(
+                    "✅ Skill pack already at {} (use `{} skills update` to refresh)",
+                    local.display(),
+                    crate::bundle::cli_name()
+                );
+            }
+            local
+        }
+    };
 
-    let local = local_skill_dir()?;
-    let already_present = local.join("SKILL.md").exists();
+    let owned_targets = known_owned_skill_targets(&local)?;
 
-    if !already_present || force {
-        fetch_into(&local, from_main, all_platforms)
-            .with_context(|| format!("failed to fetch skill pack to {}", local.display()))?;
-        println!("✅ Skill pack at {}", local.display());
-    } else {
-        println!(
-            "✅ Skill pack already at {} (use `cua-driver skills update` to refresh)",
-            local.display()
-        );
-    }
+    // Remove only selected agents' legacy links, and only when those links
+    // target a known Cua-owned pack. Shared legacy storage can still serve an
+    // unselected agent, so sweep it only for the historical unfiltered mode.
+    sweep_legacy_skill_pack(
+        &selected_agents,
+        &owned_targets,
+        options.agent_keys.is_empty() && options.source != SkillSource::Local,
+    );
 
     let mut linked_any = false;
-    for agent in AGENTS {
-        match link_agent(*agent, &local) {
-            Ok(true) => linked_any = true,
-            Ok(false) => {}
+    for agent in selected_agents {
+        match link_agent(agent, &local, &owned_targets) {
+            Ok(LinkChange::Created | LinkChange::Retargeted | LinkChange::AlreadyCorrect) => {
+                linked_any = true
+            }
+            Ok(
+                LinkChange::ParentMissing
+                | LinkChange::PreservedDirectory
+                | LinkChange::PreservedUserLink,
+            ) => {}
             Err(e) => eprintln!("  warning: failed to link {}: {e}", agent.label),
         }
     }
     if !linked_any {
-        println!("(No agent skills dirs present yet — install Claude Code / Codex / Prime Agent / OpenClaw / OpenCode / Antigravity / Hermes then re-run.)");
+        println!("(No requested agent skill link was installed; review the messages above.)");
     }
     Ok(())
 }
@@ -354,56 +513,62 @@ fn install(flags: &[String], force: bool) -> Result<()> {
 /// Only when those dirs are actually empty — never blows away a
 /// legacy install that still has packages/ alongside.
 ///
-/// Runs at the start of `install` / `update` so a user who had any
-/// flavour of the legacy layout installed gets cleanly migrated
-/// without having to run `skills uninstall` first.
+/// Runs during `install` / `update`. Explicit `--agent` selections remove only
+/// those agents' known-owned legacy links and preserve shared legacy storage;
+/// the historical all-agent mode also sweeps shared storage.
 ///
 /// Silent on failure — this is a UX nicety, not a correctness boundary.
 /// The new pack still installs even if a stale junction can't be cleaned.
-fn sweep_legacy_skill_pack() {
-    // (1) Old pack NAME under new home dir.
-    if let Ok(home) = home_dir() {
-        let legacy_local = home.join("skills").join(LEGACY_SKILL_PACK_NAME);
-        if legacy_local.exists() {
-            if let Err(e) = fs::remove_dir_all(&legacy_local) {
-                eprintln!(
-                    "  warning: could not remove legacy local pack at {}: {e}",
-                    legacy_local.display()
-                );
-            } else {
-                println!(
-                    "  cleaned up legacy local pack at {}",
-                    legacy_local.display()
-                );
-            }
-        }
-    }
-    // (2) + (3) Any pack name under the pre-rename home dir, then try
-    // to remove the empty skills/ + home/ dirs themselves.
-    if let Some(legacy_home) = legacy_home_dir() {
-        let legacy_skills_dir = legacy_home.join("skills");
-        for name in [SKILL_PACK_NAME, LEGACY_SKILL_PACK_NAME] {
-            let dir = legacy_skills_dir.join(name);
-            if dir.exists() {
-                if let Err(e) = fs::remove_dir_all(&dir) {
+fn sweep_legacy_skill_pack(
+    selected_agents: &[Agent],
+    owned_targets: &[PathBuf],
+    remove_shared_storage: bool,
+) {
+    if remove_shared_storage {
+        // (1) Old pack NAME under new home dir.
+        if let Ok(home) = home_dir() {
+            let legacy_local = home.join("skills").join(LEGACY_SKILL_PACK_NAME);
+            if legacy_local.exists() {
+                if let Err(e) = fs::remove_dir_all(&legacy_local) {
                     eprintln!(
-                        "  warning: could not remove legacy pack at {}: {e}",
-                        dir.display()
+                        "  warning: could not remove legacy local pack at {}: {e}",
+                        legacy_local.display()
                     );
                 } else {
-                    println!("  cleaned up legacy local pack at {}", dir.display());
+                    println!(
+                        "  cleaned up legacy local pack at {}",
+                        legacy_local.display()
+                    );
                 }
             }
         }
-        // remove_dir refuses to delete non-empty dirs — safe to ignore
-        // errors here, and intentional: a legacy install that still has
-        // packages/ alongside the (now-emptied) skills/ keeps its
-        // dot-folder.
-        let _ = fs::remove_dir(&legacy_skills_dir);
-        let _ = fs::remove_dir(&legacy_home);
+        // (2) + (3) Any pack name under the pre-rename home dir, then try
+        // to remove the empty skills/ + home/ dirs themselves.
+        if let Some(legacy_home) = legacy_home_dir() {
+            let legacy_skills_dir = legacy_home.join("skills");
+            for name in [SKILL_PACK_NAME, LEGACY_SKILL_PACK_NAME] {
+                let dir = legacy_skills_dir.join(name);
+                if dir.exists() {
+                    if let Err(e) = fs::remove_dir_all(&dir) {
+                        eprintln!(
+                            "  warning: could not remove legacy pack at {}: {e}",
+                            dir.display()
+                        );
+                    } else {
+                        println!("  cleaned up legacy local pack at {}", dir.display());
+                    }
+                }
+            }
+            // remove_dir refuses to delete non-empty dirs — safe to ignore
+            // errors here, and intentional: a legacy install that still has
+            // packages/ alongside the (now-emptied) skills/ keeps its
+            // dot-folder.
+            let _ = fs::remove_dir(&legacy_skills_dir);
+            let _ = fs::remove_dir(&legacy_home);
+        }
     }
     // Agent links named `<parent>/cua-driver-rs`.
-    for agent in AGENTS {
+    for agent in selected_agents {
         let parent = match agent.parent_path() {
             Ok(p) => p,
             Err(_) => continue,
@@ -414,6 +579,22 @@ fn sweep_legacy_skill_pack() {
         }
         if !is_symlink_or_junction(&legacy_link) {
             // Real directory — don't clobber user-managed content.
+            continue;
+        }
+        let is_owned = fs::read_link(&legacy_link)
+            .ok()
+            .map(|target| absolute_link_target(&legacy_link, &target))
+            .is_some_and(|target| {
+                owned_targets
+                    .iter()
+                    .any(|owned| paths_equivalent(&target, owned))
+            });
+        if !is_owned {
+            println!(
+                "  legacy {} link at {} is user-managed; preserving it",
+                agent.label,
+                legacy_link.display()
+            );
             continue;
         }
         if let Err(e) = remove_link(&legacy_link) {
@@ -432,61 +613,171 @@ fn sweep_legacy_skill_pack() {
     }
 }
 
-/// Returns `Ok(true)` when a new link was created, `Ok(false)` when
-/// skipped (parent dir missing, link already there, etc.).
-fn link_agent(agent: Agent, local_skill_dir: &Path) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkChange {
+    Created,
+    Retargeted,
+    AlreadyCorrect,
+    ParentMissing,
+    PreservedDirectory,
+    PreservedUserLink,
+}
+
+fn link_agent(
+    agent: Agent,
+    local_skill_dir: &Path,
+    owned_targets: &[PathBuf],
+) -> Result<LinkChange> {
     let parent = agent.parent_path()?;
     if !parent.exists() {
-        return Ok(false);
+        println!(
+            "  {} agent dir not present at {}",
+            agent.label,
+            parent.display()
+        );
+        return Ok(LinkChange::ParentMissing);
     }
     let link = agent.link_path()?;
-    // Four states for `link`:
-    //   1. doesn't exist at all                 → create
-    //   2. exists + resolves                    → already linked (skip)
-    //   3. exists as link/junction but target dangling → remove + recreate
-    //   4. exists as a real directory           → user-managed, leave alone
-    //
-    // `Path::exists()` follows symlinks, so it returns false for a
-    // dangling link even though `symlink_metadata` succeeds — that's
-    // the signature of case 3. We then check `is_symlink_or_junction`
-    // before deleting, so we never touch a real user directory.
-    let has_metadata = link.symlink_metadata().is_ok();
-    let resolves = link.exists();
-    if has_metadata && resolves {
+    reconcile_skill_link(agent.label, &link, local_skill_dir, owned_targets)
+}
+
+fn reconcile_skill_link(
+    agent_label: &str,
+    link: &Path,
+    expected_target: &Path,
+    owned_targets: &[PathBuf],
+) -> Result<LinkChange> {
+    if link.symlink_metadata().is_err() {
+        make_dir_symlink(expected_target, link).with_context(|| {
+            format!(
+                "symlink {} -> {}",
+                link.display(),
+                expected_target.display()
+            )
+        })?;
+        println!("  ✅ linked {agent_label} skill at {}", link.display());
+        return Ok(LinkChange::Created);
+    }
+
+    if !is_symlink_or_junction(link) {
         println!(
-            "  {} skill link already exists at {} (skipping)",
-            agent.label,
+            "  {agent_label} path at {} is a real directory/file; preserving it",
             link.display()
         );
-        return Ok(false);
+        return Ok(LinkChange::PreservedDirectory);
     }
-    if has_metadata && !resolves && is_symlink_or_junction(&link) {
-        // Dangling link/junction — target was removed (typical after
-        // sweep_legacy_skill_pack cleaned a pre-rename pack out from
-        // under it). Remove + recreate pointing at the new target.
-        if let Err(e) = remove_link(&link) {
-            eprintln!(
-                "  warning: could not remove stale {} link at {}: {e}",
-                agent.label,
-                link.display()
-            );
-            return Ok(false);
-        }
+
+    let raw_target = fs::read_link(link)
+        .with_context(|| format!("read existing skill link {}", link.display()))?;
+    let current_target = absolute_link_target(link, &raw_target);
+    if paths_equivalent(&current_target, expected_target) {
         println!(
-            "  cleaned up stale {} link at {}",
-            agent.label,
-            link.display()
+            "  ✅ {agent_label} skill link already targets {}",
+            expected_target.display()
         );
+        return Ok(LinkChange::AlreadyCorrect);
     }
-    make_dir_symlink(local_skill_dir, &link).with_context(|| {
-        format!(
-            "symlink {} -> {}",
+
+    if !owned_targets
+        .iter()
+        .any(|owned| paths_equivalent(&current_target, owned))
+    {
+        println!(
+            "  {agent_label} skill link at {} targets user-managed {}; preserving it",
             link.display(),
-            local_skill_dir.display()
-        )
-    })?;
-    println!("  ✅ linked {} skill at {}", agent.label, link.display());
-    Ok(true)
+            current_target.display()
+        );
+        return Ok(LinkChange::PreservedUserLink);
+    }
+
+    atomic_retarget_skill_link(expected_target, link)?;
+    println!(
+        "  ✅ retargeted {agent_label} skill: {} → {}",
+        link.display(),
+        expected_target.display()
+    );
+    Ok(LinkChange::Retargeted)
+}
+
+fn absolute_link_target(link: &Path, raw_target: &Path) -> PathBuf {
+    if raw_target.is_absolute() {
+        raw_target.to_path_buf()
+    } else {
+        link.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(raw_target)
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn known_owned_skill_targets(expected_target: &Path) -> Result<Vec<PathBuf>> {
+    let mut targets = vec![expected_target.to_path_buf(), local_skill_dir()?];
+    let base = {
+        #[cfg(windows)]
+        {
+            PathBuf::from(std::env::var("USERPROFILE").map_err(|_| anyhow!("USERPROFILE not set"))?)
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?)
+        }
+    };
+    for product_home in [".cua-driver", ".cua-driver-local", ".cua-driver-rs"] {
+        let home = base.join(product_home);
+        for name in [SKILL_PACK_NAME, LEGACY_SKILL_PACK_NAME] {
+            targets.push(home.join("skills").join(name));
+        }
+        targets.push(
+            home.join("packages")
+                .join("current")
+                .join("Skills")
+                .join(SKILL_PACK_NAME),
+        );
+    }
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
+}
+
+#[cfg(not(windows))]
+fn atomic_retarget_skill_link(target: &Path, link: &Path) -> Result<()> {
+    let parent = link
+        .parent()
+        .ok_or_else(|| anyhow!("skill link has no parent: {}", link.display()))?;
+    let mut attempt = 0_u32;
+    let temporary = loop {
+        let candidate = parent.join(format!(
+            ".{SKILL_PACK_NAME}.tmp-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::os::unix::fs::symlink(target, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if let Err(error) = fs::rename(&temporary, link) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_retarget_skill_link(target: &Path, link: &Path) -> Result<()> {
+    // Directory junction replacement has no atomic primitive on Windows. Keep
+    // the ownership gate above load-bearing, then use the shortest possible
+    // remove/recreate window.
+    remove_link(link)?;
+    make_dir_symlink(target, link)
 }
 
 #[cfg(windows)]
@@ -725,16 +1016,33 @@ fn remove_link(p: &Path) -> Result<()> {
 
 // ── status ─────────────────────────────────────────────────────────────────
 
-fn status() -> Result<()> {
-    let local = local_skill_dir()?;
-    if local.exists() && local.join("SKILL.md").exists() {
-        println!("Local skill pack: {} ✅", local.display());
+fn status(flags: &[String]) -> Result<()> {
+    let options = parse_skill_options(flags)?;
+    let expected = match options.source {
+        SkillSource::Local => local_bundled_skill_dir()?,
+        SkillSource::Release | SkillSource::Main => local_skill_dir()?,
+    };
+    let expected_version = skill_version(&expected);
+    let source_label = match options.source {
+        SkillSource::Local => "checkout-staged local pack",
+        SkillSource::Main => "fetched upstream-main pack",
+        SkillSource::Release => "version-matched release pack",
+    };
+    if expected.join("SKILL.md").is_file() {
+        println!(
+            "Expected source: {source_label} at {} (version {}) ✅",
+            expected.display(),
+            expected_version.as_deref().unwrap_or("unknown")
+        );
     } else {
-        println!("Local skill pack: not installed (`cua-driver skills install` to fetch)");
+        println!(
+            "Expected source: {source_label} is not installed at {}",
+            expected.display()
+        );
     }
     println!();
     println!("Agent links:");
-    for agent in AGENTS {
+    for agent in options.selected_agents() {
         let parent = match agent.parent_path() {
             Ok(p) => p,
             Err(_) => continue,
@@ -752,25 +1060,122 @@ fn status() -> Result<()> {
         if !link.exists() && link.symlink_metadata().is_err() {
             println!("  {} — not linked ({})", agent.label, link.display());
         } else if is_symlink_or_junction(&link) {
-            let target = fs::read_link(&link).ok();
-            match target {
-                Some(t) => println!(
-                    "  {} — ✅ linked: {} → {}",
+            match inspect_skill_link(&link, &expected, expected_version.as_deref()) {
+                Ok(LinkInspection::Current { target, version }) => println!(
+                    "  {} — ✅ current: {} → {} (version {})",
                     agent.label,
                     link.display(),
-                    t.display()
+                    target.display(),
+                    version.as_deref().unwrap_or("unknown")
                 ),
-                None => println!("  {} — ✅ linked: {}", agent.label, link.display()),
+                Ok(LinkInspection::Mismatch {
+                    target,
+                    version,
+                    target_matches,
+                    version_matches,
+                    content_matches,
+                    dangling,
+                }) => println!(
+                    "  {} — ⚠ mismatch: {} → {}; expected {}; target_match={}; version={} (expected {}, match={}); content_match={}; dangling={}",
+                    agent.label,
+                    link.display(),
+                    target.display(),
+                    expected.display(),
+                    target_matches,
+                    version.as_deref().unwrap_or("unknown"),
+                    expected_version.as_deref().unwrap_or("unknown"),
+                    version_matches,
+                    content_matches,
+                    dangling
+                ),
+                Err(error) => println!(
+                    "  {} — ⚠ could not inspect {}: {error}",
+                    agent.label,
+                    link.display()
+                ),
             }
         } else {
             println!(
-                "  {} — non-symlink path at {} (left alone)",
+                "  {} — ⚠ source/target mismatch: non-symlink path at {} (left alone)",
                 agent.label,
                 link.display()
             );
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkInspection {
+    Current {
+        target: PathBuf,
+        version: Option<String>,
+    },
+    Mismatch {
+        target: PathBuf,
+        version: Option<String>,
+        target_matches: bool,
+        version_matches: bool,
+        content_matches: bool,
+        dangling: bool,
+    },
+}
+
+fn inspect_skill_link(
+    link: &Path,
+    expected: &Path,
+    expected_version: Option<&str>,
+) -> Result<LinkInspection> {
+    let raw_target =
+        fs::read_link(link).with_context(|| format!("read skill link {}", link.display()))?;
+    let target = absolute_link_target(link, &raw_target);
+    let dangling = !target.exists();
+    let target_matches = paths_equivalent(&target, expected);
+    let version = skill_version(&target);
+    let version_matches = expected_version.is_some() && version.as_deref() == expected_version;
+    let content_matches = packs_match(&target, expected);
+    if !dangling && target_matches && version_matches && content_matches {
+        Ok(LinkInspection::Current { target, version })
+    } else {
+        Ok(LinkInspection::Mismatch {
+            target,
+            version,
+            target_matches,
+            version_matches,
+            content_matches,
+            dangling,
+        })
+    }
+}
+
+fn skill_version(pack: &Path) -> Option<String> {
+    let skill = fs::read_to_string(pack.join("SKILL.md")).ok()?;
+    skill.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("version:")
+            .map(str::trim)
+            .and_then(|value| value.split_whitespace().next())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn packs_match(left: &Path, right: &Path) -> bool {
+    if paths_equivalent(left, right) {
+        return true;
+    }
+    SKILL_FILES.iter().all(|file| {
+        let left = fs::read(left.join(file));
+        let right = fs::read(right.join(file));
+        match (left, right) {
+            (Ok(left), Ok(right)) => left == right,
+            (Err(left), Err(right)) => {
+                left.kind() == std::io::ErrorKind::NotFound
+                    && right.kind() == std::io::ErrorKind::NotFound
+            }
+            _ => false,
+        }
+    })
 }
 
 fn print_path() -> Result<()> {
@@ -781,9 +1186,152 @@ fn print_path() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_tar_gz, AgentParent, AGENTS, SKILL_FILES};
-    use std::path::PathBuf;
+    use super::{
+        extract_tar_gz, inspect_skill_link, parse_skill_options, reconcile_skill_link,
+        validate_local_selection, AgentParent, LinkChange, LinkInspection, SkillSource, AGENTS,
+        SKILL_FILES,
+    };
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn flag(value: &str) -> String {
+        value.to_owned()
+    }
+
+    fn write_pack(path: &Path, version: &str, marker: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        for file in SKILL_FILES {
+            let contents = if *file == "SKILL.md" {
+                format!("---\nname: cua-driver\nversion: {version}\n---\n{marker}\n")
+            } else {
+                format!("{file}: {marker}\n")
+            };
+            std::fs::write(path.join(file), contents).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_agent_parser_selects_only_requested_agents() {
+        let options = parse_skill_options(&[
+            flag("--local"),
+            flag("--agent"),
+            flag("codex"),
+            flag("--agent=claude"),
+            flag("--agent"),
+            flag("codex"),
+        ])
+        .unwrap();
+
+        assert_eq!(options.source, SkillSource::Local);
+        assert_eq!(options.agent_keys, ["codex", "claude"]);
+        assert_eq!(
+            options
+                .selected_agents()
+                .iter()
+                .map(|agent| agent.key)
+                .collect::<Vec<_>>(),
+            ["claude", "codex"]
+        );
+        assert!(validate_local_selection(&options).is_ok());
+        assert!(!options
+            .selected_agents()
+            .iter()
+            .any(|agent| agent.key == "hermes"));
+    }
+
+    #[test]
+    fn local_install_requires_an_explicit_agent_and_rejects_source_conflicts() {
+        let no_agent = parse_skill_options(&[flag("--local")]).unwrap();
+        assert!(validate_local_selection(&no_agent)
+            .unwrap_err()
+            .to_string()
+            .contains("requires at least one explicit --agent"));
+        assert!(parse_skill_options(&[
+            flag("--local"),
+            flag("--from"),
+            flag("main"),
+            flag("--agent"),
+            flag("codex"),
+        ])
+        .is_err());
+        assert!(parse_skill_options(&[flag("--agent"), flag("unknown")]).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn known_owned_link_is_atomically_retargeted_without_touching_siblings() {
+        let root = tempdir().unwrap();
+        let parent = root.path().join("skills");
+        let old = root.path().join("old-owned");
+        let expected = root.path().join("current");
+        std::fs::create_dir_all(&parent).unwrap();
+        write_pack(&old, "0.5.7", "old");
+        write_pack(&expected, "0.19.3", "new");
+        let link = parent.join("cua-driver");
+        let unrelated = parent.join("unrelated-skill");
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("SKILL.md"), "user skill").unwrap();
+
+        let change = reconcile_skill_link("Codex", &link, &expected, &[old]).unwrap();
+
+        assert_eq!(change, LinkChange::Retargeted);
+        assert_eq!(std::fs::canonicalize(&link).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_to_string(unrelated.join("SKILL.md")).unwrap(),
+            "user skill"
+        );
+        assert!(!parent.join(".cua-driver.tmp").exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn real_directory_and_user_symlink_are_preserved() {
+        let root = tempdir().unwrap();
+        let expected = root.path().join("current");
+        let user = root.path().join("user-pack");
+        write_pack(&expected, "0.19.3", "new");
+        write_pack(&user, "custom", "user");
+
+        let directory = root.path().join("real-directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            reconcile_skill_link("Codex", &directory, &expected, &[]).unwrap(),
+            LinkChange::PreservedDirectory
+        );
+
+        let link = root.path().join("user-link");
+        std::os::unix::fs::symlink(&user, &link).unwrap();
+        assert_eq!(
+            reconcile_skill_link("Claude Code", &link, &expected, &[]).unwrap(),
+            LinkChange::PreservedUserLink
+        );
+        assert_eq!(std::fs::canonicalize(&link).unwrap(), user);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn status_inspection_surfaces_target_version_and_content_mismatch() {
+        let root = tempdir().unwrap();
+        let expected = root.path().join("current");
+        let stale = root.path().join("stale");
+        write_pack(&expected, "0.19.3", "new");
+        write_pack(&stale, "0.5.7", "old");
+        let link = root.path().join("cua-driver");
+        std::os::unix::fs::symlink(&stale, &link).unwrap();
+
+        let inspection = inspect_skill_link(&link, &expected, Some("0.19.3")).unwrap();
+        assert!(matches!(
+            inspection,
+            LinkInspection::Mismatch {
+                target_matches: false,
+                version_matches: false,
+                content_matches: false,
+                dangling: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn prime_agent_target_matches_its_native_global_skill_directory() {
@@ -909,6 +1457,68 @@ mod tests {
                 "browser skill lost required clipboard outcome guidance: {required}"
             );
         }
+    }
+
+    #[test]
+    fn bundled_hyprland_skill_keeps_local_session_and_schema_contract() {
+        let skill_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Skills/cua-driver");
+        let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        let linux = std::fs::read_to_string(skill_dir.join("LINUX.md")).unwrap();
+        let recording = std::fs::read_to_string(skill_dir.join("RECORDING.md")).unwrap();
+
+        for required in [
+            "- cua-driver-local",
+            "start_session({session:\"my-named-run\"",
+            "set_agent_cursor_enabled({session:\"my-named-run\", enabled:true})",
+            "set_agent_cursor_motion({session:\"my-named-run\", idle_hide_ms:0})",
+            "element_index` **and** the `snapshot_id`",
+            "end_session({session:\"my-named-run\"})",
+        ] {
+            assert!(
+                skill.contains(required),
+                "missing skill contract: {required}"
+            );
+        }
+        for forbidden in [
+            "action:\"show_menu\"",
+            "Try `show_menu`",
+            "`screenshot` or the PNG",
+        ] {
+            assert!(
+                !skill.contains(forbidden),
+                "obsolete skill example remains: {forbidden}"
+            );
+        }
+
+        for required in [
+            "hyprctl -j clients",
+            "zwlr_virtual_pointer_manager_v1` version 2",
+            "confirms it within 500 ms",
+            "guarded restore deliberately does nothing",
+            "do not accept `session` in v0.19.3",
+        ] {
+            assert!(
+                linux.contains(required),
+                "missing Hyprland contract: {required}"
+            );
+        }
+        for forbidden in [
+            "list_windows({session",
+            "list_apps({session",
+            "launch_app({session",
+            "on_current_space",
+            "creates_new_application_instance",
+        ] {
+            assert!(
+                !linux.contains(forbidden),
+                "invalid Linux schema example: {forbidden}"
+            );
+        }
+
+        assert!(recording.contains("Video is off by default"));
+        assert!(recording.contains("record_video:true"));
+        assert!(!recording.contains("Video on by default"));
+        assert!(!recording.contains("video on\nby default"));
     }
 
     #[test]

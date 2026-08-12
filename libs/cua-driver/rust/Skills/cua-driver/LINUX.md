@@ -1,10 +1,17 @@
-# cua-driver — Linux
+# cua-driver-local — Linux
+
+Follow the named-session lifecycle in `SKILL.md`: start a non-default session,
+enable its agent cursor, set `idle_hide_ms:0`, pass that session on every action
+and on state/cursor/recording calls that advertise it, and always call
+`end_session` in cleanup. Linux `list_apps`, `list_windows`, and `launch_app`
+do not accept `session` in v0.19.3.
 
 The Linux backend drives X11 apps **in the background**: clicks and
 keystrokes are injected to the target window without raising it,
 activating it, or moving the real pointer — the same no-foreground
 contract the macOS and Windows backends hold. The full tool surface is
-supported: `click`, `type_text`, scroll, `press_key`, `screenshot`,
+supported: `click`, `type_text`, scroll, `press_key`, window/desktop state
+capture,
 `launch_app`, `list_apps`, `list_windows`, `get_window_state`, and
 session recording.
 
@@ -59,7 +66,7 @@ and Windows surface:
 
 `bring_to_front` is not part of the normal input ladder. For an ordinary
 `background_unavailable` response, retry only the refused action with
-`delivery_mode:"foreground"`; cua-driver activates the target, performs the
+`delivery_mode:"foreground"`; cua-driver-local activates the target, performs the
 action, and restores the prior active window. Use `bring_to_front` only when a
 focus-proxy surface must remain foreground across multiple calls, such as a
 remote desktop session, or when repeated action-scoped activation prevents the
@@ -84,33 +91,25 @@ matrix below).
 
 ## Perception and the ax/px action choice
 
-`get_window_state` is **perception-mode-agnostic** — by default it returns
-**both** the AT-SPI tree **and** a screenshot in one call. You ground on both
-and cross-check; the tree **lies** on some surfaces (Electron echo-confirms
-`setValue`, virtualized/off-viewport rows report bogus `h:1` frames), so a
-grounding screenshot is always present by default. There is no capture mode to
-pick.
-
-**Perf opt-out — `include_screenshot`** (boolean, default `true`). Pass
-`include_screenshot:false` to skip the screen grab and return tree-only — the
-cheap path when you're re-indexing before an **element ax action** and don't
-need fresh pixels. It's a **perf** knob, not a modality choice.
-
-**`capture_mode` is DEPRECATED and IGNORED.** It's still *accepted* so old
-callers don't error, but it has **no effect** — both the tree and the
-screenshot come back regardless of what you pass (`ax`/`vision`/`som`). There
-is no `ax`/`vision`/`som` capture choice anymore; drop that vocabulary.
+`get_window_state({session, pid, window_id})` returns the AT-SPI tree and a
+screenshot by default. Pass `include_screenshot:false` only for a deliberate
+tree-only performance path. The legacy `capture_mode` input is accepted but
+ignored; there is no alternate capture mode and no standalone screenshot tool.
+The tree can be misleading on some surfaces (Electron echo-confirms `setValue`,
+and virtualized rows can report bogus frames), so cross-check against the image
+from that same response.
 
 Modality is chosen at **action time**, by how you address the target:
 
 - **element ax action** — `element_token` (preferred), or the matching
   `element_index` + `snapshot_id` pair → AT-SPI
   `do_action`. Backgroundable, driver-verifiable.
-- **element px action** — `x,y` → pixel rung, read straight off the screenshot
-  already in the `get_window_state` response. Best-effort; caller-confirmed.
+- **element px action** — `x,y` → pixel rung, grounded in the screenshot
+  returned by the same `get_window_state` response. Best-effort;
+  caller-confirmed.
 
 `get_window_state` returning `degraded:true` (empty AT-SPI walk) is the cue to
-do an **element px action** off that same screenshot (X11) or escalate to
+do an **element px action** from that snapshot's image (X11), or escalate to
 `delivery_mode:"foreground"` (standard Wayland: raw background pixels cannot
 target an unfocused window there). The nested compositor has its own
 experimental per-surface routes.
@@ -119,7 +118,7 @@ experimental per-surface routes.
 
 The capture/dispatch/addressing params are a shared cross-platform
 contract (see `SKILL.md` → *Cross-platform parameter contract*) — the
-same `session`, `delivery_mode`, `capture_mode`, `scope`, `modifier`,
+same `session`, `delivery_mode`, `scope`, `modifier`,
 `element_index`/`snapshot_id`/`element_token` *shapes* as macOS and Windows, gated in
 CI so the three surfaces can't drift. Linux-relevant notes:
 
@@ -147,7 +146,7 @@ native `do_action` acknowledgement alone is not task completion.
 
 AT-SPI — the accessibility tree behind `get_window_state`, element-indexed
 clicks, and focus-free `type_text` — lives **entirely on the desktop
-session's D-Bus**. cua-driver reaches it via `DBUS_SESSION_BUS_ADDRESS`. When
+session's D-Bus**. cua-driver-local reaches it via `DBUS_SESSION_BUS_ADDRESS`. When
 the daemon is started *inside* a normal desktop login that variable is already
 exported and everything works. When it is started **outside** the session —
 a container entrypoint, a headless box, `runuser`/`su` into the desktop user,
@@ -155,16 +154,16 @@ a systemd *system* unit, or a VNC session running its own ad-hoc bus — the
 variable is unset, the AT-SPI registry walk comes back empty, and
 `get_window_state` reports **every** window as having no elements.
 
-cua-driver now **auto-discovers the session bus at startup** (mirroring the
+cua-driver-local now **auto-discovers the session bus at startup** (mirroring the
 `XAUTHORITY` recovery): if `DBUS_SESSION_BUS_ADDRESS` is unset it adopts
 `/run/user/<uid>/bus`, or reads the address out of a running desktop-session
 process's `/proc/<pid>/environ` (`xfce4-session`, `gnome-session`, …). So the
 common headless cases now "just work". The two things that still must be true:
 
 1. **An accessibility bus must be running** in that session, and
-   **`toolkit-accessibility` must be on** — cua-driver advertises a screen
+   **`toolkit-accessibility` must be on** — cua-driver-local advertises a screen
    reader at startup to flip it, but a session with no a11y bus at all
-   (`/usr/libexec/at-spi-bus-launcher`) can't expose a tree. `cua-driver
+   (`/usr/libexec/at-spi-bus-launcher`) can't expose a tree. `cua-driver-local
    doctor` now probes `org.a11y.Bus` for real (not just "is there a bus?")
    and tells you which of the two is missing.
 2. The daemon must run **as the desktop user** (so it can read that user's
@@ -212,6 +211,42 @@ driver selects a backend from compositor capabilities:
 - The optional `cua-compositor` is a separate nested session enabled
   explicitly for controlled automation. GNOME and KDE never switch into it.
 
+### Hyprland native contract
+
+On Hyprland, `list_windows({pid?})` reads `hyprctl -j clients`, filters
+unmapped clients and CUA agent-cursor overlay windows, and returns opaque
+surrogate `window_id` values. Re-list to refresh. The registry retains identity
+tombstones so a closed client's allocator-derived address cannot silently
+retarget an old id.
+
+Window capture verifies that the client is visible on an active workspace and
+uses `grim -g` with its current compositor geometry. Desktop capture uses
+`grim` across the enabled-output layout. The driver retains capture-pixel
+coordinates until dispatch, then converts them using fresh Hyprland monitor
+geometry and scale; do not pre-convert them or substitute compositor-global
+coordinates.
+
+Raw pointer input uses `zwlr_virtual_pointer_manager_v1` version 2 and binds the
+virtual pointer to the named output containing the fresh target point. It
+refuses points outside enabled outputs, output reconfiguration between capture
+and dispatch, and a held drag that crosses outputs. These refusals are safety
+boundaries, not retry cues.
+
+Window-scoped raw input requires `delivery_mode:"foreground"`. Before input,
+the driver records the prior full window identity, focuses the exact target,
+and confirms it within 500 ms. Hyprland 0.55's Lua dispatcher is preferred,
+with the legacy `focuswindow` dispatcher retained for older releases. Identity,
+visibility, output geometry, and active focus are revalidated immediately
+before dispatch. Cleanup restores the prior focus only when the target is still
+active and the prior complete identity is still live; if the user changed focus
+or the prior window disappeared, the guarded restore deliberately does nothing.
+
+For Linux launch, call `list_apps({})` and round-trip its `launch_path`
+into `launch_app({launch_path, additional_arguments:[...]})`. The Linux
+result provides a `pid` when the executable is spawned directly; it does not
+promise a `windows` array. Call `list_windows({pid})` and select its
+returned `window_id` before observing or acting.
+
 Sway recording works through the wlroots recorder path and is exercised by the
 canonical harness runner. Portal-backed GNOME recording is still an evidence
 gap. Capture and recording availability therefore depend on the compositor,
@@ -234,7 +269,7 @@ raw background PX possible on a standard compositor.
 
 If a tool call surprises you on Linux:
 
-1. `cua-driver doctor` — reports the display server (X11 / Wayland),
+1. `cua-driver-local doctor` — reports the display server (X11 / Wayland),
    **whether `org.a11y.Bus` actually answers on the session bus** (not just
    "is there a bus"), the discovered `DBUS_SESSION_BUS_ADDRESS`, and
    `ffmpeg` availability (for recording).
@@ -259,7 +294,7 @@ foregrounds a target:
 - `xdotool windowactivate <wid>` — activates.
 - `xdotool key --window <wid> alt+Tab` — focus churn.
 
-Prefer cua-driver tools with an explicit `window_id`. When in doubt,
+Prefer cua-driver-local tools with an explicit `window_id`. When in doubt,
 ask the user.
 
 ## What to expect

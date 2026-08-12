@@ -463,11 +463,15 @@ pub fn parse_command() -> Command {
         println!("skills options (agent skill-pack management, opt-in):");
         println!("  cua-driver skills install       Fetch the versioned skill pack from GitHub Releases and symlink it");
         println!("                                  into each detected agent's skills/ dir (Claude Code, Codex, Prime Agent,");
-        println!("                                  OpenClaw, OpenCode). Idempotent. Never overwrites existing user links.");
-        println!("  cua-driver skills update        Re-fetch the skill pack from GitHub, refreshing the local copy + links.");
+        println!("                                  OpenClaw, OpenCode, Antigravity, Hermes). Idempotent; preserves user links.");
+        println!("  cua-driver skills update        Refresh the selected source pack and reconcile known CUA-owned links.");
         println!("  cua-driver skills uninstall     Remove the agent symlinks. Add --all to also delete the local copy.");
         println!("  cua-driver skills status        Report local install state + per-agent link state. Read-only.");
         println!("  cua-driver skills path          Print where the local skill pack lives.");
+        println!("  --local                         Use or inspect the pack staged by install-local.sh (no network).");
+        println!(
+            "  --agent <name>                  Limit install/update/status to this agent; repeat as needed."
+        );
         println!("  --from main                     (install only) Fetch latest from main branch instead of the tagged release.");
         println!();
         println!("browser preparation approval:");

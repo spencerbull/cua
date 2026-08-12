@@ -520,9 +520,12 @@ for _daemon_bin in "$INSTALLED_BIN" "$BIN_TARGET"; do
 done
 unset _daemon_bin
 
-# Agent skill pack symlinks: NOT auto-created. Run
-# `cua-driver skills install --local` to symlink agent dirs to the
-# staged copy at $VERSIONED_DIR/Skills/cua-driver-rs above.
+# Agent skill-pack symlinks are opt-in and selective. The local binary links
+# directly through packages/current so later source reinstalls refresh the pack
+# without touching agent directories again. Repeat --agent for each intended
+# host; no unrequested agent is changed.
+echo "To install this local skill pack for Codex + Claude Code:"
+echo "  $INSTALLED_BIN skills install --local --agent codex --agent claude"
 echo ""
 
 # --- Autostart (optional) ----------------------------------------------

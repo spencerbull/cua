@@ -11,27 +11,28 @@ automation, session recording, and platform-specific limitations. The skill
 defaults to background delivery and requires structured refusal or observed
 failure before a caller escalates to foreground input.
 
-## Install Cua Driver
+## Install this checkout's local driver
 
-macOS or Linux:
+This fork skill uses the isolated `cua-driver-local` identity. From the repository
+root on macOS or Linux:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"
+libs/cua-driver/scripts/install-local.sh --release
+cua-driver-local doctor
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://cua.ai/driver/install.ps1 | iex
+./libs/cua-driver/scripts/install-local.ps1 -Release
+cua-driver-local doctor
 ```
 
-Then verify the current host:
+The public curl and PowerShell release installers instead create the canonical
+`cua-driver` identity. They are valid for upstream releases, but they do not
+create `cua-driver-local` and are not the install path for this fork pack.
 
-```bash
-cua-driver doctor
-```
-
-On macOS, the installed `CuaDriver.app` needs Accessibility and Screen
+On macOS, the installed `CuaDriverLocal.app` needs Accessibility and Screen
 Recording permission. On Windows, the daemon must run in an interactive user
 desktop rather than Session 0. On Linux, the daemon must share the graphical
 session and AT-SPI session bus.
@@ -44,16 +45,18 @@ From ClawHub:
 clawhub install @cua/driver
 ```
 
-Or let the installed driver add the version-matched skill to detected agent
-directories:
+Install the staged local pack only for the requested agents:
 
 ```bash
-cua-driver skills install
+cua-driver-local skills install --local --agent codex --agent claude
 ```
 
-The direct installer keeps only the current host's platform guide by default.
-Use `--all-platforms` when the agent assists users across operating systems.
-`cua-driver skills update` refreshes the pack to match a later driver release.
+Repeat `--agent` to select targets; unselected agents and unrelated skills are
+left alone. `cua-driver-local skills update --local --agent codex --agent claude`
+atomically retargets known CUA-owned links after the local installer stages a
+new pack, while preserving real directories and unrelated symlinks. Use
+`cua-driver-local skills status --local --agent codex --agent claude` to report
+source, target, version, or content drift.
 
 ## Reading order
 
@@ -94,18 +97,19 @@ missing. See `RECORDING.md`.
 
 ## Updates and source builds
 
-The skill is versioned with Cua Driver releases. For bleeding-edge validation
-against `main`:
+The skill is versioned with Cua Driver releases. After rebuilding from this
+checkout, refresh only the selected local links:
 
 ```bash
-cua-driver skills install --from main
+cua-driver-local skills update --local --agent codex --agent claude
 ```
 
 From a local checkout, `libs/cua-driver/scripts/install-local.sh` installs the
-source-built macOS driver as `cua-driver-local` and `CuaDriverLocal.app`, without
-replacing the release installation. Keep standalone and embedded identity rules from
-`MACOS.md` and `EMBEDDING.md`; launching a raw binary is not a substitute for
-the stable app identity that owns macOS TCC grants.
+source-built driver as `cua-driver-local` (and `CuaDriverLocal.app` on macOS),
+without replacing the upstream release installation. Keep standalone and
+embedded identity rules from `MACOS.md` and `EMBEDDING.md`; launching a raw
+binary is not a substitute for the stable app identity that owns macOS TCC
+grants.
 
 ## License
 

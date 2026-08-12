@@ -1,6 +1,11 @@
-# cua-driver — Windows
+# cua-driver-local — Windows
 
-Orchestrates Windows app automation via the `cua-driver` binary (`cua-driver.exe`). Whenever a user
+Follow the named-session lifecycle in `SKILL.md`: start a non-default session,
+enable its agent cursor, set `idle_hide_ms:0`, pass that session on every action
+and on state/cursor/recording calls that advertise it, and always call
+`end_session` in cleanup.
+
+Orchestrates Windows app automation via the `cua-driver-local` binary (`cua-driver-local.exe`). Whenever a user
 asks to drive a native Windows app, follow the loop in this doc
 rather than calling tools ad-hoc — the snapshot-before-action
 invariant is not optional and silently breaks if you skip it.
@@ -63,7 +68,7 @@ turns the pixel coord into a UIA Invoke at that point and delivers
 through the accessibility channel — no flash, no focus steal. Only
 escalate to `delivery_mode:"foreground"` when you actually see a
 `background_unavailable` structured error. Retry only that action with
-`delivery_mode:"foreground"`; cua-driver briefly activates the target, delivers
+`delivery_mode:"foreground"`; cua-driver-local briefly activates the target, delivers
 the input, and restores the previous foreground.
 
 Empirical: pixel-clicks via `delivery_mode:"background"` against the UWP
@@ -98,7 +103,7 @@ macOS / X11, where a background pixel click can still land in the background.)
 The normal flow when an agent gets that error:
 
 1. Reissue only the refused action with `delivery_mode:"foreground"`.
-2. cua-driver activates the target, delivers through SendInput, and restores
+2. cua-driver-local activates the target, delivers through SendInput, and restores
    the previous foreground.
 3. Continue with `delivery_mode:"background"` for later actions unless they
    are also refused.
@@ -174,8 +179,8 @@ frontmost state:
   the cursor and synthesizes input. The cursor warps to coordinates,
   any handler in the topmost window at those coordinates fires, and
   for most apps the receiving window activates because input arrived
-  from the OS-trusted pipeline. Use `click({pid, x, y})` or
-  `click({pid, element_index})` instead — both route per-pid and
+  from the OS-trusted pipeline. Use `click({session, pid, x, y})` or
+  `click({session, pid, element_token})` instead — both route per-pid and
   never touch the OS cursor.
 - **`SendInput(KEYBDINPUT)` with no target HWND** — same idea: goes
   to the focused window, not your target. Use `hotkey({pid, keys:
@@ -207,7 +212,7 @@ frontmost state:
   drive backgrounded, use `launch_app({urls: [url]})` — Chromium-
   family browsers open each URL in a new **window**. Each window has
   its own `window_id`, its own UIA tree, and can be inspected /
-  interacted with via `element_index` without activating or switching
+  interacted with via `element_token` without activating or switching
   anything. Tabs are a UX grouping for humans; cua-driver-rs
   workflows should default to windows.
 
@@ -225,7 +230,7 @@ frontmost state:
 
 Reading state is fine. Listing windows, reading registry, querying
 process info via `Get-Process`, calling `tasklist`, walking UIA trees
-via `cua-driver get_window_state` — none of these change focus.
+via `cua-driver-local get_window_state` — none of these change focus.
 **Mutating state via shell shims is the line.**
 
 **Corollary — the Win+Search rule.** Don't use Win+S/Win+Q "open Start
@@ -236,7 +241,7 @@ activation path which `SW_SHOWNORMAL`s it. Use `launch_app({name})` /
 `{aumid}` / `{path}` instead.
 
 **"Open \<app\>" in user speech means launch, not activate.**
-`cua-driver launch_app` is the one correct path for process startup —
+`cua-driver-local launch_app` is the one correct path for process startup —
 it's idempotent (no-op on a running app), returns the pid, and
 internally uses `SW_SHOWNOACTIVATE` plus the AppX-broker activation
 flow for packaged apps so the target's window comes up without
@@ -318,10 +323,10 @@ on a Chromium target falls through to `send_click_synthesized`
   so the tool response is not proof that the previous foreground has already
   been restored.
 
-## Defaults — always prefer cua-driver over shell shims
+## Defaults — always prefer cua-driver-local over shell shims
 
-**Default transport is the `cua-driver` CLI** — `Bash` shelling out
-to `cua-driver <tool-name>` with JSON piped via stdin (avoids
+**Default transport is the `cua-driver-local` CLI** — `Bash` shelling out
+to `cua-driver-local <tool-name>` with JSON piped via stdin (avoids
 PowerShell 5.1's argv quoting quirks for strings containing both
 quotes and spaces). MCP tools (prefix `mcp__cua-driver__*`) only when
 the user explicitly asks for them. CLI wins because it picks up
@@ -329,27 +334,27 @@ rebuilds instantly, failures are easier to diagnose, and there's no
 per-tool schema-load overhead.
 
 Every reference to `click(...)`, `get_window_state(...)` etc. in this
-doc means `cua-driver <name>` with JSON piped via stdin — translate
+doc means `cua-driver-local <name>` with JSON piped via stdin — translate
 to MCP form only when MCP is requested.
 
 ### CLI argument plumbing on Windows
 
-Three equivalent shapes for passing JSON to `cua-driver <tool>`:
+Three equivalent shapes for passing JSON to `cua-driver-local <tool>`:
 
 1. **Stdin pipe (recommended)** — avoids PS quoting bugs entirely:
    ```powershell
-   '{"pid":1234,"text":"hello world"}' | & cua-driver call type_text
+   '{"pid":1234,"text":"hello world"}' | & cua-driver-local call type_text
    ```
 2. **Positional with escaped quotes** — works for JSON without spaces
    in string values:
    ```powershell
-   & cua-driver call list_windows '{\"app_name\":\"Calculator\"}'
+   & cua-driver-local call list_windows '{\"pid\":1234}'
    ```
    (Windows PowerShell 5.1 mangles `{"x":"with space"}` when both `"`
    and ` ` appear unquoted in argv. Use stdin for those.)
 3. **`--%` stop-parser directive** (PowerShell 5.1 specific):
    ```powershell
-   & cua-driver call type_text --% {"pid":1234,"text":"hello world"}
+   & cua-driver-local call type_text --% {"pid":1234,"text":"hello world"}
    ```
 
 Stdin is the only path immune to all PS quoting edge cases. Prefer it.
@@ -369,9 +374,9 @@ gone wrong — re-read "The no-foreground contract" above.
 | Move or resize one exact window    | `set_window_frame({pid, window_id, x, y, width, height})`                                       | PowerShell Add-Type wrappers, Win+Arrow, or title-bar dragging                      |
 | Click / type / scroll / keys       | `click`, `type_text`, `scroll`, `press_key`, `hotkey`                                           | `SendInput`, `cliclick`-style C# add-types, AutoHotkey scripts                       |
 | Drag / drag-and-drop               | `drag({pid, from_x, from_y, to_x, to_y})`                                                       | `SendInput` with `MOUSEEVENTF_MOVE`, mouse_event                                     |
-| Screenshot                         | `screenshot` or the PNG in `get_window_state`                                                   | `[System.Windows.Forms.Screen]::CopyFromScreen`, `nircmd savescreenshot`             |
+| Capture a window                   | The PNG in `get_window_state({session, pid, window_id})`                                         | `[System.Windows.Forms.Screen]::CopyFromScreen`, `nircmd savescreenshot`             |
 | Quit an app                        | ask the user first, then `hotkey({pid, keys:["alt","f4"]})`                                     | `taskkill /F`, `Stop-Process -Force`, `Get-Process \| Stop-Process`                  |
-| Hand a file/URL to an app          | `launch_app({urls:[<path>]})` (default app) or `{path: "...exe", args:[<file>]}` (specific app) | `& "app.exe" "file"`, `Invoke-Item`, shell associations                              |
+| Hand a file/URL to an app          | `launch_app({urls:[<path>]})` (default app) or `{path: "...exe", additional_arguments:[<file>]}` (specific app) | `& "app.exe" "file"`, `Invoke-Item`, shell associations                              |
 
 ### The narrow carve-out
 
@@ -381,14 +386,14 @@ asked for frontmost state ("bring Edge to the front", "make
 Calculator visible", "I want to see it"). Reaching for it because a
 tool call returned something confusing is wrong — diagnose first.
 
-When a cua-driver call surprises you, diagnose cua-driver first:
+When a cua-driver-local call surprises you, diagnose cua-driver-local first:
 
 - **`Posted click to pid X` instead of `Performed UIA Invoke ...`?**
   The (x,y) UIA hit-test didn't find an `InvokePattern`-bearing
   element at that pixel inside the target HWND, so it fell through
   to `PostMessage(WM_LBUTTONDOWN)`. For UWP / WebView2 surfaces,
   PostMessage silently no-ops — re-snapshot via
-  `get_window_state(pid, window_id)` and use `element_index` so the
+  `get_window_state({session, pid, window_id})` and use its `element_token` so the
   daemon can invoke the cached UIA element by identity instead of by
   point.
 - **`Invalid element_index` / `No cached UIA state`?** You either
@@ -415,7 +420,7 @@ When a cua-driver call surprises you, diagnose cua-driver first:
 - **`list_windows` returns Win32 windows but misses UWP / WebView2
   windows?** UIA desktop enumeration may be degraded because a provider
   is unresponsive. `list_windows` falls back to Win32-only output instead
-  of hanging; run `cua-driver doctor` and retry after the provider
+  of hanging; run `cua-driver-local doctor` and retry after the provider
   recovers.
 - **`get_desktop_state` returns `desktop_scope_disabled`?** That's
   intended: full-display capture is a **desktop-scope** operation, gated
@@ -430,7 +435,7 @@ When a cua-driver call surprises you, diagnose cua-driver first:
   means UWP and you're on the PostMessage path. UWP processes
   pointer input via `Windows.UI.Input`, NOT through HWND message
   queues — PostMessage(WM_LBUTTONDOWN) gets ignored. Use
-  `element_index` instead of (x,y) for UWP targets.
+  `element_token` instead of (x,y) for UWP targets.
 
 Only after those are ruled out should you fall through to the
 activate fallback. Always name the focus steal in your response
@@ -443,15 +448,15 @@ Before every `Bash` call whose command line touches any Windows app
 run the self-check:
 
 1. **Does this command foreground the target?** If yes — stop and
-   translate to the cua-driver equivalent from the mapping table.
+   translate to the cua-driver-local equivalent from the mapping table.
 2. **Does this command move the user's real cursor?** (`SendInput`,
    `SetCursorPos` from inline C#, AutoHotkey scripts, `nircmd
 sendmouse`.) If yes — stop; use `click({pid, x, y})` which routes
    per-HWND via PostMessage / per-element via UIA Invoke and never
    warps the cursor.
-3. **Does this command bypass cua-driver entirely?** (PowerShell
+3. **Does this command bypass cua-driver-local entirely?** (PowerShell
    GUI scripts, AutoHotkey, `SendKeys`, AppleScript-equivalent
-   automation tools.) If yes — stop; find the cua-driver tool that
+   automation tools.) If yes — stop; find the cua-driver-local tool that
    does the intent.
 
 If all three are "no," the command is safe. If you can't answer,
@@ -461,13 +466,13 @@ your prior tool calls earned.
 
 ## Prerequisites — check before starting
 
-1. **`cua-driver` is on `$PATH`** — `Get-Command cua-driver` or
-   `where.exe cua-driver`. Install location:
-   `%LOCALAPPDATA%\Programs\trycua\cua-driver-rs\bin\cua-driver.exe`,
-   added to the user PATH by the install script.
-   If missing, point the user at:
+1. **`cua-driver-local` is on `$PATH`** — `Get-Command cua-driver-local` or
+   `where.exe cua-driver-local`. Install location:
+   `%LOCALAPPDATA%\Programs\Cua\cua-driver-local\bin\cua-driver-local.exe`,
+   added to the user PATH by the local install script.
+   If missing, point the user at the checkout and run:
    ```powershell
-   irm https://cua.ai/driver/install.ps1 | iex
+   ./libs/cua-driver/scripts/install-local.ps1 -Release
    ```
    and stop.
 2. **The runtime owner must run in an interactive session (Session 1+),
@@ -477,20 +482,20 @@ your prior tool calls earned.
    `IApplicationActivationManager` all silently return empty /
    timeout in Session 0. Check:
    ```powershell
-   Get-Process cua-driver | Select Id,SessionId
+   Get-Process cua-driver-local | Select Id,SessionId
    ```
    `SessionId == 0` is refused before runtime actions. The autostart Scheduled Task uses
    `LogonType=Interactive` so the daemon lands in the user's logon
    session. If you started the daemon via SSH-into-Windows, that
    session is usually Session 0 — kick the autostart task instead:
    ```powershell
-   schtasks /Run /TN cua-driver-serve
+   schtasks /Run /TN cua-driver-local-serve
    ```
-3. **Run `cua-driver doctor`** — reports session ID, COM apartment
+3. **Run `cua-driver-local doctor`** — reports session ID, COM apartment
    status, UIA desktop-enumeration reachability, install paths,
    version. If anything reads `false` / `error`, fix that before
    tool-calling.
-4. **Permissions** — Windows has no TCC equivalent. cua-driver-rs
+4. **Permissions** — Windows has no TCC equivalent. cua-driver-local
    needs:
    - No admin elevation for normal use (UIA, PostMessage, UWP
      activation all work from a standard user token).
@@ -501,54 +506,54 @@ your prior tool calls earned.
      may flag the unsigned binary on first run. Click "More info →
      Run anyway" once.
 
-## Using cua-driver from the shell
+## Using cua-driver-local from the shell
 
 Tool names are `snake_case`, management subcommands are
-`kebab-case` — no ambiguity. Tools invoked as `cua-driver call
+`kebab-case` — no ambiguity. Tools invoked as `cua-driver-local call
 <tool-name>` with JSON via stdin or positional arg. Management
 subcommands:
 
-- **`cua-driver serve`** — start the persistent daemon used by one-shot CLI
+- **`cua-driver-local serve`** — start the persistent daemon used by one-shot CLI
   calls or by MCP clients that explicitly select it with `--socket`. Bare
-  `cua-driver mcp` owns its runtime directly on Windows.
+  `cua-driver-local mcp` owns its runtime directly on Windows.
   Normally not run manually — the autostart Scheduled Task fires it
   at every interactive logon. If you stopped it (`Stop-Process`),
-  re-run with `schtasks /Run /TN cua-driver-serve`, not by spawning
-  `cua-driver serve` from SSH (Session 0 problem).
-- **`cua-driver stop`** / **`status`** — daemon lifecycle.
-- **`cua-driver doctor`** — full diagnostics.
-- **`cua-driver list-tools`** / **`describe <tool>`** — tool surface
+  re-run with `schtasks /Run /TN cua-driver-local-serve`, not by spawning
+  `cua-driver-local serve` from SSH (Session 0 problem).
+- **`cua-driver-local stop`** / **`status`** — daemon lifecycle.
+- **`cua-driver-local doctor`** — full diagnostics.
+- **`cua-driver-local list-tools`** / **`describe <tool>`** — tool surface
   discovery.
-- **`cua-driver autostart {enable|disable|status|kick}`** — manage the
+- **`cua-driver-local autostart {enable|disable|status|kick}`** — manage the
   Scheduled Task that auto-starts the daemon at logon. `enable`
   registers it (idempotent — replaces existing). `kick` runs it
   immediately without waiting for a fresh logon.
-- **`cua-driver recording start|stop|status`** — see `RECORDING.md`.
+- **`cua-driver-local recording start|stop|status`** — see `RECORDING.md`.
   Windows video uses ffmpeg with `gdigrab`; trajectory evidence continues
   without video when ffmpeg is unavailable.
 
-Over SSH, never use bare `cua-driver mcp`: the direct runtime rejects Session 0. Start the daemon in the interactive user session and run `cua-driver mcp
---socket \\.\pipe\cua-driver` from SSH.
+Over SSH, never use bare `cua-driver-local mcp`: the direct runtime rejects Session 0. Start the daemon in the interactive user session and run `cua-driver-local mcp
+--socket \\.\pipe\cua-driver-local` from SSH.
 
 Canonical multi-step workflow:
 
 ```powershell
 # Daemon is already running via Scheduled Task.
 # Launch UWP Calculator without focus-stealing.
-'{"aumid":"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"}' | & cua-driver call launch_app
+'{"aumid":"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"}' | & cua-driver-local call launch_app
 # → {pid: 6004, windows: [{window_id: 459672, ...}]}
 
 # Snapshot the UIA tree.
-'{"pid":6004,"window_id":459672}' | & cua-driver call get_window_state
+'{"pid":6004,"window_id":459672}' | & cua-driver-local call get_window_state
 # Returns: tree_markdown with [N] indices plus structured element_token values,
 # snapshot_id, screenshot, and dimensions.
 
 # Click the "Equals" row with its opaque token from that response.
-'{"pid":6004,"element_token":"s0000002a:22"}' | & cua-driver call click
+'{"pid":6004,"element_token":"s0000002a:22"}' | & cua-driver-local call click
 # → "✅ Performed UIA Invoke on [22] ..."
 
 # Re-snapshot to verify the action landed.
-'{"pid":6004,"window_id":459672}' | & cua-driver call get_window_state
+'{"pid":6004,"window_id":459672}' | & cua-driver-local call get_window_state
 ```
 
 ## The core invariant — snapshot before AND after every action
@@ -765,16 +770,16 @@ typed browser tools yet.
 
 ## Common failure modes (Windows-specific)
 
-- **`Session 0` daemon** — `cua-driver doctor` reports
+- **`Session 0` daemon** — `cua-driver-local doctor` reports
   `SessionId: 0`. UIA enumeration returns empty, screenshot
   returns blank. Fix: stop the daemon, kick the autostart task with
-  `schtasks /Run /TN cua-driver-serve`.
+  `schtasks /Run /TN cua-driver-local-serve`.
 - **Stale HWND** (`Invalid window handle 0x80070578`) — the window
   was closed, re-created (e.g. UWP shutdown-on-idle), or moved to
   a different desktop session. Re-resolve via `list_windows`.
 - **Calc display stuck at "0" after pixel clicks** — the (x,y) UIA
   hit-test missed and PostMessage fell through (PostMessage is a
-  silent no-op on UWP). Switch to `element_index` mode. Symptom:
+  silent no-op on UWP). Switch to `element_token` mode. Symptom:
   the action result reports `route:"synthetic_events"` instead of
   `route:"accessibility"`.
 - **LibreOffice (VCL) `type_text` / `hotkey` reported success but
@@ -787,7 +792,7 @@ typed browser tools yet.
   - **`hotkey` / `press_key`** (keystroke + key-combo): `delivery_mode:"background"`
     surfaces a `background_unavailable` error for VCL.
   - **`type_text`** does a **UIA read-back** and returns the shared
-    `ActionResult`. With an `element_index`, the ValuePattern path returns
+    `ActionResult`. With an `element_token`, the ValuePattern path returns
     `effect:"confirmed"` with `evidence:[{"kind":"value_readback"}]` only
     when the complete expected value is synchronously visible and differs from
     the prior value. If SetValue succeeded but the provider still exposes the
@@ -801,7 +806,7 @@ typed browser tools yet.
     contains the requested text, the result stays `effect:"unverifiable"` because
     WM_CHAR does not expose the insertion point. Take a fresh snapshot before
     retrying. It may recommend foreground when a background insert appears
-    dropped. Passing an `element_index` makes the
+    dropped. Passing an `element_token` makes the
     read-back target that exact element by handle (ValuePattern → TextPattern),
     independent of foreground focus. Without one, PostMessage verification
     falls back to system-wide `GetFocusedElement`, which normally resolves only
@@ -827,14 +832,15 @@ typed browser tools yet.
   output.
 - **JPEG screenshot has more compression than expected** — default
   quality on the MCP screenshot compat path is 85; for raw
-  `cua-driver call screenshot`, defaults to PNG (no compression).
+  `get_window_state` returns a screenshot by default; pass
+  `include_screenshot:false` only for a deliberate tree-only call.
   Pass `{format: "jpeg", quality: 70}` to opt into compressed
   screenshots. The `max_image_dimension` config (default 2048)
   downscales via Lanczos3 before encoding.
 
 ## Diagnostics
 
-`cua-driver doctor` reports:
+`cua-driver-local doctor` reports:
 
 - Daemon version and install paths
 - Current session ID (must be ≥1)
@@ -847,13 +853,13 @@ typed browser tools yet.
 Run it whenever a tool call returns unexpectedly. Most failures
 trace back to one of these checks reading "false."
 
-`cua-driver autostart status` reports whether the daemon is
+`cua-driver-local autostart status` reports whether the daemon is
 registered to auto-start at logon AND whether it's currently running:
 
 - `not-registered` — Task Scheduler explicitly reported that the named task
-  does not exist. Re-register via `cua-driver autostart enable`.
+  does not exist. Re-register via `cua-driver-local autostart enable`.
 - `registered (not running)` — autostart task exists but no daemon
-  process. Kick it with `cua-driver autostart kick`.
+  process. Kick it with `cua-driver-local autostart kick`.
 - `registered (running)` — happy path.
 - `permission-denied` — the current process cannot inspect Task Scheduler;
   registration is unknown. Re-run the status check from a context that can

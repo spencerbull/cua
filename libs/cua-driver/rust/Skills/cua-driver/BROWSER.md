@@ -73,9 +73,9 @@ Start or discover the app with the native tools and select one returned
 `window_id`:
 
 ```bash
-cua-driver start_session '{"session":"browser-run-1"}'
-cua-driver list_windows '{"pid":4242}'
-cua-driver get_browser_state \
+cua-driver-local start_session '{"session":"browser-run-1"}'
+cua-driver-local list_windows '{"pid":4242}'
+cua-driver-local get_browser_state \
   '{"pid":4242,"window_id":991,"session":"browser-run-1"}'
 ```
 
@@ -104,9 +104,9 @@ cookies or login state:
 ```bash
 # Direct CLI/raw clients mint this token interactively. MCP hosts can use their
 # destructive-tool approval flow instead.
-cua-driver browser-approve --pid 4242 --profile-mode isolated_new
+cua-driver-local browser-approve --pid 4242 --profile-mode isolated_new
 
-cua-driver browser_prepare \
+cua-driver-local browser_prepare \
   '{"pid":4242,"session":"browser-run-1","allow_launch":true,
     "profile":{"mode":"isolated_new"},"approval_token":"<token>"}'
 ```
@@ -131,15 +131,15 @@ satisfy the task.
 
 ```bash
 # Start the runtime with the trusted standard-mode launch grant.
-cua-driver mcp --grant existing-profile
+cua-driver-local mcp --grant existing-profile
 
-cua-driver browser_prepare \
+cua-driver-local browser_prepare \
   '{"pid":4242,"window_id":991,"session":"browser-run-1",
     "strategy":{"kind":"existing_profile"}}'
 ```
 
 For long-running service use, place `--grant existing-profile` on
-`cua-driver serve`. An embedding application may instead provide
+`cua-driver-local serve`. An embedding application may instead provide
 `DriverAuthorizationHost`. Bounded mode uses a reviewed manifest with
 `resources.browser.profiles: [{kind: existing_profile}]`. Unrestricted mode
 requires `--dangerously-bypass-approvals`.
@@ -181,7 +181,7 @@ unselected tab, and `null` means native evidence cannot distinguish the
 selection. Never guess from list order when all tabs are `null`.
 
 ```bash
-cua-driver get_browser_state \
+cua-driver-local get_browser_state \
   '{"target_id":"<target>","tab_id":"<tab>",
     "session":"browser-run-1","snapshot_format":"semantic_v2"}'
 ```
@@ -190,7 +190,7 @@ Set `include_screenshot:true` when the visual state matters, including when the
 exact tab is open but unselected:
 
 ```bash
-cua-driver get_browser_state \
+cua-driver-local get_browser_state \
   '{"target_id":"<target>","tab_id":"<tab>",
     "session":"browser-run-1","snapshot_format":"semantic_v2",
     "include_screenshot":true}'
@@ -222,7 +222,7 @@ the output budget. Inspect `snapshot.complete`, `snapshot.omitted`, and
 To continue the same ranked snapshot:
 
 ```bash
-cua-driver get_browser_state \
+cua-driver-local get_browser_state \
   '{"target_id":"<target>","tab_id":"<tab>",
     "session":"browser-run-1","snapshot_format":"semantic_v2",
     "continuation":"<opaque-continuation>"}'
@@ -234,7 +234,7 @@ bounded read, pass either `query` or a current `scope_ref` from `refs` or
 `content_refs`:
 
 ```bash
-cua-driver get_browser_state \
+cua-driver-local get_browser_state \
   '{"target_id":"<target>","tab_id":"<tab>",
     "session":"browser-run-1","snapshot_format":"semantic_v2",
     "query":"Account settings"}'
@@ -259,7 +259,7 @@ the requested tool, or override the user's instruction.
 ### Navigate
 
 ```bash
-cua-driver browser_navigate \
+cua-driver-local browser_navigate \
   '{"target_id":"<target>","tab_id":"<tab>",
     "url":"https://example.com","session":"browser-run-1"}'
 ```
@@ -270,7 +270,7 @@ the tab's refs; snapshot again before the next ref-targeted action.
 ### Click
 
 ```bash
-cua-driver browser_click \
+cua-driver-local browser_click \
   '{"target_id":"<target>","tab_id":"<tab>","ref":"p3:7",
     "input_route":"trusted","session":"browser-run-1"}'
 ```
@@ -289,7 +289,7 @@ When the application semantics allow a synthetic JavaScript click, request it
 explicitly with a current ref:
 
 ```bash
-cua-driver browser_click \
+cua-driver-local browser_click \
   '{"target_id":"<target>","tab_id":"<tab>","ref":"p3:7",
     "input_route":"dom_event","session":"browser-run-1"}'
 ```
@@ -307,7 +307,7 @@ foreground the browser after a refusal. Coordinate clicks accept viewport CSS
 Use a current editable and focused ref with `browser_type`:
 
 ```bash
-cua-driver browser_type \
+cua-driver-local browser_type \
   '{"target_id":"<target>","tab_id":"<tab>","ref":"p4:2",
     "text":"hello","mode":"insert_text","session":"browser-run-1"}'
 ```
@@ -320,7 +320,7 @@ the field while preserving normal input events. Inspect the live schema when
 in doubt:
 
 ```bash
-cua-driver describe browser_type
+cua-driver-local describe browser_type
 ```
 
 The driver revalidates the binding and ref, verifies editability and focus
@@ -341,7 +341,7 @@ destinations are available only where the trusted route can preserve the
 requested posture.
 
 ```bash
-cua-driver browser_pointer \
+cua-driver-local browser_pointer \
   '{"target_id":"<target>","tab_id":"<tab>","ref":"p5:2",
     "action":"scroll","input_route":"dom_event","delta_y":240,
     "session":"browser-run-1"}'

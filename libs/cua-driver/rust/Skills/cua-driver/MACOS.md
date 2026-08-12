@@ -1,4 +1,9 @@
-# cua-driver — macOS specifics
+# cua-driver-local — macOS specifics
+
+Follow the named-session lifecycle in `SKILL.md`: start a non-default session,
+enable its agent cursor, set `idle_hide_ms:0`, pass that session on every action
+and on state/cursor/recording calls that advertise it, and always call
+`end_session` in cleanup.
 
 This file is the macOS-specific extension to `SKILL.md`.
 The cross-platform core (snapshot invariant, CLI/MCP defaults,
@@ -9,7 +14,7 @@ you're driving an app on macOS.
 ## The no-foreground contract
 
 **The user's frontmost app MUST NOT change.** This is the whole
-reason cua-driver exists. Users pay for the right to keep typing in
+reason cua-driver-local exists. Users pay for the right to keep typing in
 their editor while an agent drives another app in the background.
 Violate this rule and every other nice property the driver gives
 you (no cursor warp, no Space switch, no window raise) stops
@@ -88,7 +93,7 @@ element action when the same command has an ordinary control, and prefer
 menu bars” below.
 
 **"Open \<app\>" in user speech means launch, not activate.**
-`cua-driver launch_app` is the one correct path for process
+`cua-driver-local launch_app` is the one correct path for process
 startup — it's idempotent (no-op on a running app), returns the
 pid, and has an internal `FocusRestoreGuard` that catches
 `NSApp.activate(ignoringOtherApps:)` calls the target makes during
@@ -108,7 +113,7 @@ is safe even for apps that normally foreground on media-load
 | Move or resize one exact window       | `set_window_frame({pid, window_id, x, y, width, height})`                              | `osascript` position/size writes or title-bar dragging      |
 | Click / type / scroll / keys          | `click`, `type_text`, `scroll`, `press_key`, `hotkey`                                  | `osascript`, `cliclick`, raw `CGEvent`, `open <url>`        |
 | Drag / drag-and-drop / marquee select | `drag({pid, from_x, from_y, to_x, to_y})` (pixel-only — macOS AX has no semantic drag) | `cliclick dd:`, `osascript drag`                            |
-| Screenshot                            | `screenshot` or the PNG in `get_window_state`                                          | `screencapture`                                             |
+| Capture a window                      | The PNG in `get_window_state({session, pid, window_id})`                                | `screencapture`                                             |
 | Quit an app                           | ask the user first, then `hotkey({pid, keys:["cmd","q"]})`                             | `kill`, `killall`, `pkill`                                  |
 | Hand a file/URL to an app             | `launch_app({bundle_id, urls:[<path>]})`                                               | `open -a <App> <path>`, `open <url>`                        |
 
@@ -121,7 +126,7 @@ to see X"). Reaching for it because a tool call returned something
 confusing is wrong — that's the skill's classic foot-in-the-door
 failure mode and it steals focus every time.
 
-When a cua-driver call surprises you, diagnose cua-driver first:
+When a cua-driver-local call surprises you, diagnose cua-driver-local first:
 
 - **Empty `tree_markdown`?** `get_window_state` returns **both** the
   AX tree and a screenshot by default — there's nothing to configure and
@@ -199,14 +204,14 @@ Before every `Bash` call whose command line touches any macOS app
 run the self-check:
 
 1. **Does this command foreground the target?** If yes — stop and
-   translate to the cua-driver equivalent from the mapping table.
+   translate to the cua-driver-local equivalent from the mapping table.
 2. **Does this command move the user's real cursor?** (`cliclick`,
    any `CGEventPost` at `cghidEventTap` over another app's window).
    If yes — stop; use `click({pid, x, y})` which routes per-pid
    via SkyLight and never warps the cursor.
-3. **Does this command bypass cua-driver entirely?** (`osascript`
+3. **Does this command bypass cua-driver-local entirely?** (`osascript`
    mutating GUI state, AppleScript files, external helpers.) If
-   yes — stop; find the cua-driver tool that does the intent.
+   yes — stop; find the cua-driver-local tool that does the intent.
 
 If all three are "no," the command is safe. If you can't answer,
 default to stop and ask rather than proceed. A single `open -a`
@@ -215,33 +220,33 @@ editor state.
 
 ## Prerequisites — macOS
 
-1. `cua-driver` is on `$PATH` (`which cua-driver`). If not, point the
+1. `cua-driver-local` is on `$PATH` (`which cua-driver-local`). If not, point the
    user at `scripts/install-local.sh` and stop.
-2. Start the daemon with `open -n -g -a CuaDriver --args serve` (the
+2. Start the daemon with `open -n -g -a CuaDriverLocal --args serve` (the
    recommended form — goes through LaunchServices so TCC attributes
-   the process to CuaDriver.app). `cua-driver serve &` also works;
-   the CLI auto-relaunches through `open -n -g -a CuaDriver` when it
+   the process to CuaDriverLocal.app). `cua-driver-local serve &` also works;
+   the CLI auto-relaunches through `open -n -g -a CuaDriverLocal` when it
    detects a wrong-TCC context (any IDE-spawned shell: Claude Code,
-   Cursor, VS Code, Conductor). Verify with `cua-driver status`.
-3. Run `cua-driver permissions status --json`. This
+   Cursor, VS Code, Conductor). Verify with `cua-driver-local status`.
+3. Run `cua-driver-local permissions status --json`. This
    path is read-only: it checks Accessibility and Screen Recording but
    deliberately does not run Tahoe's prompt-capable direct-capture probe.
    Therefore `screen_recording_capturable` is `null` and
    `direct_capture_status` is `"not_checked"` until the explicit grant flow.
    - If Accessibility is `false`, stop. AX reads and actions cannot work;
-     tell the user to run `cua-driver permissions grant` and approve it.
+     tell the user to run `cua-driver-local permissions grant` and approve it.
    - If Screen Recording is `false`, continue only when the task can be
      completed and verified from the AX tree. Call `get_window_state` with
      `include_screenshot:false` and use element-indexed AX actions. Do not use
      screenshots, pixel coordinates, or pixel-based verification.
    - If the task materially needs pixels, stop and ask the user to run
-     `cua-driver permissions grant`. That command explains and deliberately
+     `cua-driver-local permissions grant`. That command explains and deliberately
      triggers the additional private-window-picker bypass dialog before
      verifying live capture. macOS mentions screen and audio in the combined
      consent, although Cua Driver's current recorder does not enable audio.
      If the installed app is absent from **Screen & System Audio Recording**,
-     the user should click **+**, add `/Applications/CuaDriver.app` (or
-     `/Applications/CuaDriverLocal.app`), enable it, and rerun the command.
+     the user should click **+**, add `/Applications/CuaDriverLocal.app`,
+     enable it, and rerun the command.
 
 ## Resolve target pid — always via `launch_app`
 
@@ -316,10 +321,10 @@ _Cross-platform parameter contract_):
 - **`check_permissions.prompt` is macOS-only and public calls are
   status-only.** Omitted `prompt` defaults to `false`; explicit `true` is
   refused before platform dispatch in every mode. For a signed standalone
-  install, the human-run `cua-driver permissions grant` command launches a
+  install, the human-run `cua-driver-local permissions grant` command launches a
   short-lived CuaDriver app instance through LaunchServices so macOS owns the
   approval UI and direct ScreenCaptureKit probe. In an in-process SDK runtime,
-  private embedded host, or `cua-driver mcp --direct`, the embedding host owns
+  private embedded host, or `cua-driver-local mcp --direct`, the embedding host owns
   permission UX. There is no Windows/Linux equivalent.
 - **`session` always worked on macOS;** the cross-platform change is that
   Windows/Linux stopped _rejecting_ it. No macOS-side change to how you
@@ -345,7 +350,7 @@ The working pattern:
    acceptable here — this is the carve-out the skill's osascript
    gate allows).
 2. `CGEvent.post(tap: .cghidEventTap)` with a leading `mouseMoved`
-   event (~30 ms before the click). `cua-driver click` when the
+   event (~30 ms before the click). `cua-driver-local click` when the
    target is frontmost automatically takes this path.
 3. Accept that the real cursor visibly moves — `cghidEventTap` is
    the system HID stream, the cursor warps to the click point.
@@ -363,7 +368,7 @@ There is no backgrounded path that reaches these apps today.
   left-click — a known Chromium renderer-IPC limitation that affects
   every non-HID-tap synthesis path. For context menus on
   AX-addressable elements (links, buttons, toolbar items), use
-  `right_click({pid, element_index})` instead.
+  `right_click({session, pid, element_token})` instead.
 
 ### Known text-input limits (Catalyst + Electron)
 
@@ -427,7 +432,7 @@ It refuses missing, duplicate, disabled, or non-actionable segments and never
 falls back to pixels.
 
 ```bash
-cua-driver invoke_menu \
+cua-driver-local invoke_menu \
   '{"pid":844,"window_id":10725,"path":["Window","Move & Resize","Left"]}'
 ```
 
@@ -487,7 +492,7 @@ starting point for new browser workflows.
 | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | macOS system-alert beep on `press_key` with no visible change | Target window is minimized; Return / Space / Tab commits don't establish real renderer focus on minimized windows | AX-click a clickable equivalent (Go button, Submit button, checkbox) instead of pressing the key; see "Keyboard commits on minimized windows" under the Browser section                                                             |
 | `Accessibility permission not granted`                        | TCC not granted                                                                                                   | Stop; tell user to grant in System Settings                                                                                                                                                                                         |
-| `Screen Recording permission not granted`                     | TCC not granted for capture                                                                                       | Screenshots and pixel actions are unavailable. If the task is AX-completable, use `get_window_state({include_screenshot:false})` and element-indexed actions; otherwise stop and ask the user to run `cua-driver permissions grant` |
+| `Screen Recording permission not granted`                     | TCC not granted for capture                                                                                       | Screenshots and pixel actions are unavailable. If the task is AX-completable, use `get_window_state({include_screenshot:false})` and element-indexed actions; otherwise stop and ask the user to run `cua-driver-local permissions grant` |
 
 ## Example end-to-end task (macOS)
 

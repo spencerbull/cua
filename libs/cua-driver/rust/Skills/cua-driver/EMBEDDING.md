@@ -1,4 +1,4 @@
-# Embedding cua-driver in your application without introducing new permissions
+# Embedding cua-driver-local in your application without introducing new permissions
 
 This guide is for teams shipping a macOS app (an "agent harness") that wants
 cua-driver's background computer-use and agent-cursor overlay **inside their
@@ -30,7 +30,7 @@ _not_ do (and, in embedded mode, does not do). First, launching via
 LaunchServices (`open -a …`, `NSWorkspace.open`) makes the launched app its
 own responsible process. Second, a process can explicitly _disclaim_
 responsibility for a child (`responsibility_spawnattrs_setdisclaim`), making
-the child its own responsible process — standalone cua-driver does this on
+the child its own responsible process — standalone cua-driver-local does this on
 purpose so its permissions attach to a stable `com.trycua.driver` identity
 instead of whatever terminal launched it. Embedded mode turns that off.
 
@@ -79,20 +79,20 @@ the automation runtime isolated from the application process.
 ```sh
 # env var form — set by the host on the child process
 CUA_DRIVER_EMBEDDED=1 CUA_DRIVER_HOST_BUNDLE_ID=com.yourco.yourapp \
-  cua-driver serve --socket /tmp/yourapp-cua.sock
+  cua-driver-local serve --socket /tmp/yourapp-cua.sock
 
 # after the daemon socket is ready, start the stdio MCP proxy
-CUA_DRIVER_EMBEDDED=1 cua-driver mcp --socket /tmp/yourapp-cua.sock
+CUA_DRIVER_EMBEDDED=1 cua-driver-local mcp --socket /tmp/yourapp-cua.sock
 ```
 
 Requirements on the host side:
 
-- **Spawn `cua-driver serve --embedded` directly** as a child process
+- **Spawn `cua-driver-local serve --embedded` directly** as a child process
   (`Process`/`NSTask`, `posix_spawn`, `exec` from your own code). Do
   **not** launch the daemon via `open(1)` or `NSWorkspace` — that hands it
   to LaunchServices and breaks inheritance.
 - Give the daemon a private socket and wait until it is accepting connections.
-- Spawn `cua-driver mcp --embedded --socket <path>` and speak MCP over that
+- Spawn `cua-driver-local mcp --embedded --socket <path>` and speak MCP over that
   proxy's stdin/stdout (line-delimited JSON-RPC). The proxy never executes
   tools; the host-owned daemon does.
 - Request Accessibility and Screen Recording **from your app** before (or
@@ -127,7 +127,7 @@ For unrestricted embedding, use the explicit two-part environment contract:
 CUA_DRIVER_EMBEDDED=1 \
 CUA_DRIVER_PERMISSION_MODE=unrestricted \
 CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS=1 \
-  cua-driver serve --embedded --socket /tmp/yourapp-cua.sock
+  cua-driver-local serve --embedded --socket /tmp/yourapp-cua.sock
 ```
 
 Both values are required and contradictory values fail before the daemon
@@ -236,7 +236,7 @@ TCC and executes tools.
 only keeps the driver inside its **spawner's** TCC responsibility chain. If
 your product has a GUI app that owns the macOS grants and a separate
 gateway, daemon, or Node process that spawns MCP servers, registering
-`cua-driver serve --embedded` with the gateway makes the daemon inherit the
+`cua-driver-local serve --embedded` with the gateway makes the daemon inherit the
 gateway's identity, not the app's. Spawn the daemon from the GUI app itself;
 gateways may connect an MCP proxy to the app-owned private socket.
 
@@ -244,8 +244,8 @@ gateways may connect an MCP proxy to the app-owned private socket.
 Wrong (inherits the gateway's identity):        Right:
 
 gateway / node daemon                           YourApp.app
-  └─ cua-driver serve --embedded                  ├─ cua-driver serve --embedded
-                                                  └─ cua-driver mcp --embedded
+  └─ cua-driver-local serve --embedded                  ├─ cua-driver-local serve --embedded
+                                                  └─ cua-driver-local mcp --embedded
                                                      --socket <private-path>
 ```
 
@@ -326,7 +326,7 @@ background AX read, agent-cursor glide.
 // Runs the one-grant demo sequence from EMBEDDING.md end to end:
 //   1. Requests Accessibility + Screen Recording AS THE HOST (the only
 //      prompts the user ever sees), then
-//   2. spawns an embedded cua-driver daemon plus its stdio MCP proxy and
+//   2. spawns an embedded cua-driver-local daemon plus its stdio MCP proxy and
 //      verifies attribution, takes a background screenshot,
 //      reads a background app's window state, and glides the agent-cursor
 //      overlay — with zero driver-side prompts.
@@ -438,7 +438,7 @@ send(["jsonrpc": "2.0", "id": nextId, "method": "initialize", "params": [
     "clientInfo": ["name": "ExampleAgentHarness", "version": "0.1"]]])
 _ = readMessage()
 send(["jsonrpc": "2.0", "method": "notifications/initialized"])
-log("embedded cua-driver daemon + proxy started (\(driverPath)) — no driver prompt should have appeared")
+log("embedded cua-driver-local daemon + proxy started (\(driverPath)) — no driver prompt should have appeared")
 
 // 4. check_permissions must report attribution "host" and never prompt.
 let perms = call("check_permissions")
