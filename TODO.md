@@ -70,7 +70,8 @@ named GUI-control session across pointer and keyboard actions.
   Omarchy session is normally unlocked. The lock became secure during the live
   run; credentials were not requested or entered, and the test app/session were
   cleaned up.
-- [ ] Final commits pushed.
+- [x] Reviewed commits published to the fork branch. A final evidence-only
+  update may follow after the secure session is normally unlocked.
 
 ## Open questions and checkpoints
 
